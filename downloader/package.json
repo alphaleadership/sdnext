@@ -1,0 +1,14 @@
+{
+  "name": "hf-model-downloader",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^4.19.2",
+    "https-proxy-agent": "^7.0.4",
+    "resend": "^6.28.1"
+  }
+}
