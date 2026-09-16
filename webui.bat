@@ -3,7 +3,9 @@
 :: --------------------------------------------------------------------------------------------------------------
 
 @echo off
-
+SET HTTP_PROXY=http://10.0.0.2:3128/
+SET HTTPS_PROXY=http://10.0.0.2:3128/
+set HF_XET_HTTP_PROXY=http://10.0.0.2:3128/
 if not defined PYTHON (set PYTHON=python)
 if not defined VENV_DIR (set "VENV_DIR=%~dp0%venv")
 set ERROR_REPORTING=FALSE
@@ -60,6 +62,8 @@ goto :show_stdout_stderr
 
 :activate_venv
 set PYTHON="%VENV_DIR%\Scripts\Python.exe"
+
+
 echo Using VENV: %VENV_DIR%
 
 :skip_venv
@@ -71,6 +75,7 @@ set ACCELERATE="%VENV_DIR%\Scripts\accelerate.exe"
 if EXIST %ACCELERATE% goto :accelerate_launch
 
 :launch
+
 %PYTHON% launch.py %*
 pause
 exit /b

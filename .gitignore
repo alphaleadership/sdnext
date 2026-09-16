@@ -74,3 +74,6 @@ tunableop_results*.csv
 !/.github/copilot-instructions.md
 !/.github/instructions/
 !/.github/instructions/**/*
+setup.cmd
+test.py
+downloader/*
