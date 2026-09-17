@@ -155,18 +155,19 @@ async function main() {
     // Afficher le modèle actuel
     const current = await getCurrentModel();
     log(`Modèle actuel : ${current}`);
-
+    /*
     // Générer une image
     await txt2img({
-      prompt: 'a kitsune with bikini, mountains, at the beach , photorealistic, 8k',
+      prompt: 'a kitsune with bikini, at the beach , photorealistic, 8k',
       negative_prompt: 'blurry, low quality, watermark',
       steps: 30,
       cfg_scale: 7,
+      batch_size: 4,
       width: 1024,
       height: 1024,
-      sampler_name: 'Euler a',
-    });
-
+     
+    });*/
+    await watchProgress()
     // Exemple : générer plusieurs images en batch
     // await txt2img({
     //   prompt: 'portrait of a woman, soft lighting, film photography',
@@ -177,7 +178,7 @@ async function main() {
     // });
 
     // Exemple : changer de modèle avant de générer
-    // const models = await listModels();
+     const models = await listModels();
      console.log('Modèles disponibles :', models.map(m => m.title));
     // await setModel('nom-du-modele.safetensors');
     // await txt2img({ prompt: '...' });

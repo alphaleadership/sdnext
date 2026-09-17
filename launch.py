@@ -13,7 +13,7 @@ from modules.logger import log
 
 
 debug_install = log.debug if os.environ.get('SD_INSTALL_DEBUG', None) is not None else lambda *args, **kwargs: None
-commandline_args = os.environ.get('COMMANDLINE_ARGS', "")
+commandline_args = os.environ.get('COMMANDLINE_ARGS', "--insecure")
 sys.argv += shlex.split(commandline_args)
 args = None
 parser = None

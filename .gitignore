@@ -76,4 +76,4 @@ tunableop_results*.csv
 !/.github/instructions/**/*
 setup.cmd
 test.py
-downloader/*
+downloader/.env
