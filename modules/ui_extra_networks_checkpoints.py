@@ -11,6 +11,7 @@ from modules.json_helpers import readfile
 version_map = {
     "QwenEdit": "Qwen",
     "QwenEditPlus": "Qwen",
+    "Qwen21": "Qwen 2.1",
     "Flux.1 D": "Flux",
     "Flux.1 S": "Flux",
     "FluxKontext": "Flux",
@@ -23,8 +24,6 @@ version_map = {
     "StableDiffusionXL": "SD XL",
     "WanToVideo": "Wan",
     "WanVACE": "Wan",
-    "ZImage": "Z-Image",
-    "Z-Image": "Z-Image",
     "Glm": "GLM-Image",
     "Krea2": "Krea 2",
     "AnimaTextTo": "Anima",
@@ -34,6 +33,9 @@ version_map = {
     "Flux2KleinKV": "Flux 2 Klein",
     "MiniMaxH3": "MiniMax H3",
     "MiniMax_H3": "MiniMax H3",
+    "ZImageTurbo": "Z-Image",
+    "ZImage": "Z-Image",
+    "Z": "Z-Image",
 }
 
 class ExtraNetworksPageCheckpoints(ui_extra_networks.ExtraNetworksPage):
