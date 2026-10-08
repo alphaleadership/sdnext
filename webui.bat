@@ -17,7 +17,7 @@ echo Cannot launch python
 goto :show_stdout_stderr
 
 :check_pip
-%PYTHON% -mpip --help >tmp/stdout.txt 2>tmp/stderr.txt
+%PYTHON% -m pip --help >tmp/stdout.txt 2>tmp/stderr.txt
 if %ERRORLEVEL% == 0 goto :check_uv_flag
 if "%PIP_INSTALLER_LOCATION%" == "" goto :show_stdout_stderr
 %PYTHON% "%PIP_INSTALLER_LOCATION%" >tmp/stdout.txt 2>tmp/stderr.txt

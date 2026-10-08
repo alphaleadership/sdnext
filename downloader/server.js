@@ -244,7 +244,7 @@ dotenv.config()
 const RESEND_API_KEY   = process.env.rskey;
 const EMAIL_FROM       = 'SD.Next <sdnext@arbinger.is-a.dev>';
 const EMAIL_TO         = process.env.dest;
-const WATCH_FOLDER     = 'E:\\sdnext\\outputs';
+const WATCH_FOLDER     = ['E:\\sdnext\\outputs',"./tosend"];
 const POLL_INTERVAL_MS = 3000; // vérifie toutes les 3 secondes
 // Extensions à surveiller
 const EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp'];
@@ -289,7 +289,7 @@ function sendViaResend(fileName, imageBuffer, mimeType) {
         if (res.statusCode >= 200 && res.statusCode < 300) {
           resolve(JSON.parse(data));
         } else {
-          reject(new Error(`Resend HTTP ${res.statusCode} : ${data}`));
+          reject(new Error(`Resend HTTP ${res.statusCode} `));
         }
       });
     });
@@ -301,41 +301,86 @@ function sendViaResend(fileName, imageBuffer, mimeType) {
 }
  
 async function processFile(filePath) {
+    log(`Traitement de : ${path.basename(filePath)}`);
+
+    // 1. Attendre que l'écriture soit terminée
+    const isReady = await waitForFileReady(filePath);
+    
+    if (!isReady) {
+        log(`⚠️ Le fichier ${path.basename(filePath)} semble toujours en cours d'écriture. On réessaiera plus tard.`);
+        // IMPORTANT : On retire du Set 'seen' pour que le prochain scan puisse le retrouver
+        seen.delete(filePath); 
+        return;
+    }
+
+    try {
+        // 2. Lecture du fichier (Utilise fs.promises pour être plus moderne)
+        const fileBuffer = await fs.promises.readFile(filePath);
   const fileName = path.basename(filePath);
   const ext = path.extname(fileName).toLowerCase();
-  log(`Nouvelle image détectée : ${fileName}`);
- 
-  // Attendre que SD.Next finisse d'écrire le fichier
-  await new Promise(r => setTimeout(r, 1000));
- 
-  let imageBuffer;
-  try {
-    imageBuffer = fs.readFileSync(filePath);
-  } catch (e) {
-    log(`ERREUR lecture (${fileName}) : ${e.message}`);
-    return;
-  }
- 
-  const mimeType = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
+   const mimeType = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg'
     : ext === '.webp' ? 'image/webp'
     : 'image/png';
  
-  try {
-    const data = await sendViaResend(fileName, imageBuffer, mimeType);
-    log(`Email envoyé (id=${data.id}) : ${fileName}`);
-  } catch (e) {
-    log(`ERREUR envoi (${fileName}) : ${e.message}`);
-    return; // Ne pas supprimer si l'envoi a échoué
-  }
- 
-  try {
-    fs.unlinkSync(filePath);
-    log(`Fichier supprimé : ${fileName}`);
-  } catch (e) {
-    log(`ERREUR suppression (${fileName}) : ${e.message}`);
-  }
+        // 3. Envoi via Resend
+       const data = await sendViaResend(path.basename(filePath), fileBuffer, mimeType);
+    log(`Email envoyé (id=${data.id}) : ${path.basename(filePath)}`);
+        log(`✅ Envoyé avec succès : ${path.basename(filePath)}`);
+        // On ne retire pas de 'seen' ici, le fichier est traité.
+        fs.rmSync(filePath)
+    } catch (error) {
+        log(`❌ Erreur lors de l'envoi de ${path.basename(filePath)} : ${error.message}`);
+        
+        // 4. Gestion de l'échec (déplacement vers le dossier de secours)
+        const errorDir = path.join(process.cwd(), 'tosend');
+        if (!fs.existsSync(errorDir)) fs.mkdirSync(errorDir);
+        
+        const destPath = path.join(errorDir, path.basename(filePath));
+        try {
+            fs.renameSync(filePath, destPath);
+            log(`📁 Fichier déplacé vers ${errorDir}`);
+        } catch (moveErr) {
+            log(`Critique : Impossible de déplacer le fichier : ${moveErr.message}`);
+        }
+        
+        // On retire du Set pour permettre une nouvelle tentative si le fichier est déplacé manuellement
+        seen.delete(filePath);
+    }
 }
- 
+
+ /**
+ * Vérifie si un fichier est complètement écrit sur le disque
+ * en comparant sa taille à intervalles réguliers.
+ */
+async function waitForFileReady(filePath) {
+    let lastSize = -1;
+    let attempts = 0;
+    const maxAttempts = 10; // On essaie 10 fois
+
+    while (attempts < maxAttempts) {
+        try {
+            const stats = fs.statSync(filePath);
+            const currentSize = stats.size;
+
+            // Si la taille est la même que la dernière fois et > 0, le fichier est prêt
+            if (currentSize > 0 && currentSize === lastSize) {
+                return true;
+            }
+
+            lastSize = currentSize;
+            attempts++;
+            
+            // Attendre 2 secondes avant la prochaine vérification
+            await new Promise(r => setTimeout(r, 2000)); 
+        } catch (err) {
+            // Si le fichier est verrouillé ou disparaît, on attend
+            attempts++;
+            await new Promise(r => setTimeout(r, 2000));
+        }
+    }
+    return false; // Si après 10 tentatives la taille change encore, on considère qu'il n'est pas prêt
+}
+
 function scanFolder(folder) {
   let entries;
   try {
@@ -352,15 +397,21 @@ function scanFolder(folder) {
     } else if (EXTENSIONS.includes(path.extname(entry.name).toLowerCase())) {
       if (seen.has(fullPath)) continue;
       seen.add(fullPath);
-      processFile(fullPath).catch(e => log(`ERREUR inattendue : ${e.message}`));
+      console.log(seen.size)
+      processFile(fullPath).catch(e => {
+        log(`ERREUR : ${e.message}`);
+        seen.delete(fullPath); // On retire du set si ça a échoué pour retenter plus tard
+    });
     }
   }
 }
  
 function init() {
-  if (!fs.existsSync(WATCH_FOLDER)) {
-    log(`ERREUR : dossier introuvable : ${WATCH_FOLDER}`);
-    process.exit(1);
+  WATCH_FOLDER.forEach((FOLDER)=>{
+ if (!fs.existsSync(FOLDER)) {
+  fs.mkdirSync(FOLDER)
+    log(`ERREUR : dossier introuvable : ${FOLDER}`);
+   
   }
  
   if (!SEND_EXISTING) {
@@ -371,17 +422,19 @@ function init() {
         else if (EXTENSIONS.includes(path.extname(entry.name).toLowerCase())) seen.add(fullPath);
       }
     }
-    markExisting(WATCH_FOLDER);
+    markExisting(FOLDER);
     log(`Démarrage — ${seen.size} image(s) existante(s) ignorée(s).`);
   } else {
     log('Démarrage — les images existantes seront envoyées (SEND_EXISTING=true).');
   }
  
   if (PROXY_URL) log(`Proxy : ${PROXY_URL}`);
-  log(`Surveillance de : ${WATCH_FOLDER}`);
+  log(`Surveillance de : ${FOLDER}`);
   log(`Envoi vers : ${EMAIL_TO}`);
  
-  setInterval(() => scanFolder(WATCH_FOLDER), POLL_INTERVAL_MS);
+  setInterval(() => scanFolder(FOLDER), POLL_INTERVAL_MS);
+  })
+ 
 }
  
 init();

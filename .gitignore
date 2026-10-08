@@ -77,3 +77,6 @@ tunableop_results*.csv
 setup.cmd
 test.py
 downloader/.env
+downloader/tosend/
+downloader/sortie.txt
+downloader/model.txt

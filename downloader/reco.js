@@ -180,6 +180,7 @@ async function main() {
     // Exemple : changer de modèle avant de générer
      const models = await listModels();
      console.log('Modèles disponibles :', models.map(m => m.title));
+     fs.writeFileSync("./model.txt",models.map(m => m.title).join("\n"))
     // await setModel('nom-du-modele.safetensors');
     // await txt2img({ prompt: '...' });
 
