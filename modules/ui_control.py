@@ -94,12 +94,17 @@ def get_units(*values):
                 break
 
 
-def generate_click_generator(job_id: str, state: str, active_tab: str, *args): # pylint: disable=inconsistent-return-statements
+def generate_click_generator(job_id: str, state: str, active_tab: str, scheduler: str, *args): # pylint: disable=inconsistent-return-statements
+    from modules.control.run import generate
+    if scheduler == 'scheduled':
+        for results in generate(state, scheduler, units, helpers.input_source, helpers.input_init, helpers.input_mask, active_tab, True, *args):
+            yield return_controls(results)
+        return
+
     while helpers.busy:
         debug(f'Control: tab="{active_tab}" job={job_id} busy')
         time.sleep(0.1)
-    from modules.control.run import generate
-    debug(f'Control: tab="{active_tab}" job={job_id} args={args}')
+    debug(f'Control: tab="{active_tab}" job={job_id} scheduled="{scheduler}" args={args}')
     progress.add_task_to_queue(job_id)
     with call_queue.get_lock():
         yield [None, None, None, None, 'Control: starting', '']
@@ -109,7 +114,7 @@ def generate_click_generator(job_id: str, state: str, active_tab: str, *args): #
         t = time.perf_counter()
         results = {}
         try:
-            for results in generate(state, units, helpers.input_source, helpers.input_init, helpers.input_mask, active_tab, True, *args):
+            for results in generate(state, scheduler, units, helpers.input_source, helpers.input_init, helpers.input_mask, active_tab, True, *args):
                 progress.record_results(job_id, results)
                 yield return_controls(results, t)
         except GeneratorExit:
@@ -124,12 +129,18 @@ def generate_click_generator(job_id: str, state: str, active_tab: str, *args): #
             shared.state.end(jobid)
 
 
-def generate_click(job_id: str, state: str, active_tab: str, *args):
+def generate_click(job_id: str, state: str, active_tab: str, scheduler: str, *args):
+    from modules.control.run import generate
+    if scheduler == 'scheduled': # just add to quueue without locking
+        results = None
+        for result in generate(state, scheduler, units, helpers.input_source, helpers.input_init, helpers.input_mask, active_tab, True, *args):
+            results = result
+        return return_controls(results)
+
     while helpers.busy:
         debug(f'Control: tab="{active_tab}" job={job_id} busy')
         time.sleep(0.1)
-    from modules.control.run import generate
-    debug(f'Control: tab="{active_tab}" job={job_id} args={args}')
+    debug(f'Control: tab="{active_tab}" job={job_id} scheduled="{scheduler}" args={args}')
     progress.add_task_to_queue(job_id)
     with call_queue.get_lock():
         results = None
@@ -138,7 +149,7 @@ def generate_click(job_id: str, state: str, active_tab: str, *args):
         progress.start_task(job_id)
         try:
             t = time.perf_counter()
-            for results in generate(state, units, helpers.input_source, helpers.input_init, helpers.input_mask, active_tab, True, *args):
+            for results in generate(state, scheduler, units, helpers.input_source, helpers.input_init, helpers.input_mask, active_tab, True, *args):
                 progress.record_results(job_id, results)
         except GeneratorExit:
             log.error("Control: generator exit")
@@ -152,15 +163,19 @@ def generate_click(job_id: str, state: str, active_tab: str, *args):
         return return_controls(results, t)
 
 
-async def generate_click_async(job_id: str, state: str, active_tab: str, *args):
-    return await asyncio.to_thread(generate_click, job_id, state, active_tab, *args)
+async def generate_click_async(job_id: str, state: str, active_tab: str, scheduler: str, *args):
+    return await asyncio.to_thread(generate_click, job_id, state, active_tab, scheduler, *args)
 
 
 def create_ui(_blocks: gr.Blocks=None):
     helpers.initialize()
 
     with gr.Blocks(analytics_enabled = False) as control_ui:
-        prompt, styles, negative, btn_generate, btn_reprocess, btn_paste, btn_extra, prompt_counter, btn_prompt_counter, negative_counter, btn_negative_counter  = ui_sections.create_toprow(is_img2img=False, id_part='control')
+        prompt, styles, negative, btn_generate, btn_reprocess, btn_paste, btn_extra, prompt_counter, btn_prompt_counter, negative_counter, btn_negative_counter, btn_scheduler = ui_sections.create_toprow(
+            is_img2img=False,
+            id_part='control',
+            schedule_visible=True,
+        )
         prompt_img = gr.File(label="", elem_id="control_prompt_image", file_count="single", type="binary", visible=False)
         prompt_img.change(fn=images.image_data, inputs=[prompt_img], outputs=[prompt, prompt_img])
 
@@ -195,9 +210,8 @@ def create_ui(_blocks: gr.Blocks=None):
 
                 batch_count, batch_size = ui_sections.create_batch_inputs('control', accordion=True)
 
-                seed, reuse_seed, subseed, reuse_subseed, subseed_strength, seed_resize_from_h, seed_resize_from_w = ui_sections.create_seed_inputs('control')
-                ui_common.reuse_seed(seed, reuse_seed, subseed=False)
-                ui_common.reuse_seed(subseed, reuse_subseed, subseed=True)
+                seed, reuse_seed = ui_sections.create_seed_inputs('control')
+                ui_common.reuse_seed(seed, reuse_seed)
 
                 mask_controls = masking.create_segment_ui()
 
@@ -304,6 +318,8 @@ def create_ui(_blocks: gr.Blocks=None):
             prompt.submit(**select_dict)
             negative.submit(**select_dict)
             btn_generate.click(**select_dict)
+            btn_scheduler.click(**select_dict)
+
             for ctrl in [input_image, input_video, input_batch, input_folder, init_image, tab_image, tab_video, tab_batch, tab_folder]:
                 if hasattr(ctrl, 'change'):
                     ctrl.change(**select_dict)
@@ -315,7 +331,7 @@ def create_ui(_blocks: gr.Blocks=None):
                 input_type,
                 prompt, negative, styles,
                 steps, sampler_index,
-                seed, subseed, subseed_strength, seed_resize_from_h, seed_resize_from_w,
+                seed,
                 cfg_name, cfg_scale, cfg_image, cfg_rescale, cfg_start, cfg_stop, cfg_true, cfg_adaptive,
                 clip_skip, vae_type, tiling, hidiffusion,
                 detailer_enabled, detailer_prompt, detailer_negative, detailer_steps, detailer_strength, detailer_resolution, detailer_classes,
@@ -351,13 +367,22 @@ def create_ui(_blocks: gr.Blocks=None):
             control_dict = dict(
                 fn=generate_fn,
                 _js="submit_control",
-                inputs=[tabs_state, state, tabs_state] + input_fields + input_script_args,
+                inputs=[tabs_state, state, tabs_state, tabs_state] + input_fields + input_script_args,
                 outputs=output_fields,
                 show_progress='hidden',
             )
             prompt.submit(**control_dict)
             negative.submit(**control_dict)
             btn_generate.click(**control_dict)
+
+            scheduler_dict = dict(
+                fn=generate_fn,
+                _js="submit_scheduler",
+                inputs=[tabs_state, state, tabs_state, tabs_state] + input_fields + input_script_args,
+                outputs=output_fields,
+                show_progress='hidden',
+            )
+            btn_scheduler.click(**scheduler_dict)
 
             btn_reprocess[1].click(fn=processing_vae.reprocess, inputs=[output_gallery], outputs=[output_gallery]) # full-decode
             btn_reprocess[2].click(**control_dict) # hires-refine
@@ -401,8 +426,6 @@ def create_ui(_blocks: gr.Blocks=None):
                 (batch_size, "Batch-2"),
                 # seed
                 (seed, "Seed"),
-                (subseed, "Variation seed"),
-                (subseed_strength, "Variation strength"),
                 # mask
                 (mask_controls[1], "Mask only"),
                 (mask_controls[2], "Mask invert"),
@@ -455,8 +478,6 @@ def create_ui(_blocks: gr.Blocks=None):
                 (cfg_true, "CFG true"),
                 (cfg_adaptive, "CFG adaptive"),
                 # hidden
-                (seed_resize_from_w, "Seed resize from-1"),
-                (seed_resize_from_h, "Seed resize from-2"),
                 *scripts_manager.scripts_control.infotext_fields
             ]
             generation_parameters_copypaste.add_paste_fields("control", input_image, paste_fields, override_settings)

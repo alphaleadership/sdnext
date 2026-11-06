@@ -48,7 +48,8 @@ def load_flux(checkpoint_info, diffusers_load_config=None):
 
     # finally load transformer and text encoder if not already loaded
     if transformer is None:
-        transformer = generic.load_transformer(repo_id, cls_name=diffusers.FluxTransformer2DModel, load_config=diffusers_load_config)
+        from pipelines.native_transformer import make_default_spec
+        transformer = generic.load_transformer(repo_id, cls_name=diffusers.FluxTransformer2DModel, load_config=diffusers_load_config, native_spec=make_default_spec(diffusers.FluxTransformer2DModel))
     if text_encoder_2 is None:
         text_encoder_2 = generic.load_text_encoder(repo_id, cls_name=transformers.T5EncoderModel, load_config=diffusers_load_config)
 
@@ -63,6 +64,9 @@ def load_flux(checkpoint_info, diffusers_load_config=None):
     )
 
     generic.load_vae_override(pipe, diffusers_load_config)
+    if cls_name == diffusers.FluxKontextPipeline:
+        pipe.patch_size = 2 # latents pack into 2x2 patches and the pipeline floors sizes to vae_scale_factor * 2
+        pipe.max_condition_images = 1 # one condition image per prompt
 
     if os.environ.get('SD_REMOTE_T5', None) is not None:
         from modules import sd_te_remote

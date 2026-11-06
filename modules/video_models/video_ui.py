@@ -165,7 +165,7 @@ def create_ui(prompt, negative, styles, overrides, script_inputs, mp4_fps, mp4_i
                 with gr.Tab('Frames', id='out-gallery'):
                     gallery, gen_info, html_info, _html_info_formatted, html_log = ui_common.create_output_panel("video", prompt=prompt, preview=False, transfer=False, scale=2)
 
-    ui_common.connect_reuse_seed(seed, reuse_seed, gen_info, is_subseed=False)
+    ui_common.connect_reuse_seed(seed, reuse_seed, gen_info)
     engine.change(fn=engine_change, inputs=[engine], outputs=[model])
     model.change(fn=model_change, inputs=[engine, model], outputs=[url])
     btn_load.click(fn=model_load, inputs=[engine, model], outputs=[html_log])
@@ -206,4 +206,7 @@ def create_ui(prompt, negative, styles, overrides, script_inputs, mp4_fps, mp4_i
         show_progress='hidden',
     )
     generate.click(**video_dict)
+    from modules import scheduler
+    schedule = gr.Button(visible=False, elem_id='video_schedule_btn')
+    schedule.click(fn=lambda *args: scheduler.enqueue_video_request('video', *args), inputs=state_inputs + video_inputs + script_inputs, outputs=video_outputs, show_progress='hidden')
     return engine, model, steps, sampler_index, width, height, frames, seed

@@ -49,6 +49,7 @@ import modules.ui_extra_networks
 import modules.textual_inversion
 import modules.script_callbacks
 import modules.api.middleware
+import modules.scheduler
 
 
 if not modules.loader.initialized:
@@ -409,13 +410,13 @@ def start_ui():
     if len(gradio_auth_creds) > 0:
         log.info(f'Authentication enabled: users={len(list(gradio_auth_creds))}')
     auth_pairs = []
-    for cred in gradio_auth_creds:
+    for i, cred in enumerate(gradio_auth_creds):
         if ':' not in cred:
-            log.warning(f'Ignoring malformed auth entry: "{cred}"')
+            log.warning(f'Ignoring malformed auth entry: index={i} no separator')
             continue
         user, password = cred.split(':', 1)
         if len(user) == 0 or len(password) == 0:
-            log.warning(f'Ignoring malformed auth entry: "{cred}"')
+            log.warning(f'Ignoring malformed auth entry: index={i} user="{user}"')
             continue
         auth_pairs.append((user, password))
 
@@ -505,9 +506,13 @@ def webui(restart=False, _exit=False, profiler=None):
 
     start_common()
     app = start_ui()
+    if shared.cmd_opts.test:
+        from pipelines.generic_test import test_server_wiring
+        test_server_wiring(app)
     modules.script_callbacks.after_ui_callback()
 
     load_model()
+    modules.scheduler.start_worker(shared.cmd_opts.test)
     mount_subpath(app)
     shared.demo.allowed_paths = resolve_paths(shared.demo.allowed_paths)
     shared.opts.save()

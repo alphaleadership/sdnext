@@ -4,6 +4,7 @@ import math
 import warnings
 import argparse
 import importlib
+import importlib.metadata
 from pathlib import Path
 from PIL import Image
 import torch
@@ -265,15 +266,11 @@ def get_vae_params(vae_model):
 
 def encode_vae(vae_model, batch_img: torch.Tensor) -> torch.Tensor:
     """Dynamically encodes image batch using 4D or 5D shapes depending on VAE requirements."""
-    try:
-        out = vae_model.encode(batch_img)
-    except (ValueError, RuntimeError, TypeError):
-        if batch_img.ndim == 4:
-            out = vae_model.encode(batch_img.unsqueeze(2))
-        elif batch_img.ndim == 5:
-            out = vae_model.encode(batch_img.squeeze(2))
-        else:
-            raise
+    encoder = getattr(vae_model, "encoder", None)
+    first_conv = next((module for module in encoder.modules() if isinstance(module, (nn.Conv2d, nn.Conv3d))), None) if encoder is not None else None
+    if batch_img.ndim == 4 and isinstance(first_conv, nn.Conv3d):
+        batch_img = batch_img.unsqueeze(2)
+    out = vae_model.encode(batch_img)
 
     if hasattr(out, "latent_dist"):
         lat = out.latent_dist.mode()
@@ -314,6 +311,27 @@ class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescript
     pass
 
 
+def resolve_vae_class(vae_name):
+    if ":" not in vae_name:
+        original_version = importlib.metadata.version
+
+        def compatible_version(package):
+            if package.lower().replace("_", "-") == "huggingface-hub":
+                return "1.99.0"
+            return original_version(package)
+
+        importlib.metadata.version = compatible_version
+        try:
+            importlib.import_module("transformers")
+            diffusers = importlib.import_module("diffusers")
+        finally:
+            importlib.metadata.version = original_version
+        return getattr(diffusers, vae_name)
+    module_name, class_name = vae_name.rsplit(":", 1)
+    module_name = module_name.removesuffix(".py").replace("/", ".").replace("\\", ".")
+    return getattr(importlib.import_module(module_name), class_name)
+
+
 def train():
     print('MicroDecoder Train')
     epilog = """
@@ -333,7 +351,7 @@ Metrics Legend:
     parser.add_argument("--max", type=int, default=500, help="Maximum number of dataset images to encode")
     parser.add_argument("--resolution", type=int, default=512, help="Target training image resolution")
     parser.add_argument("--crop", choices=["center", "random"], default="center", help="Cropping mode when resizing non-square images")
-    parser.add_argument("--vae", type=str, required=True, help="Diffusers VAE class name")
+    parser.add_argument("--vae", type=str, required=True, help="Diffusers VAE class name or module.py:ClassName")
     parser.add_argument("--repo", type=str, required=True, help="HuggingFace model repository path")
     parser.add_argument("--subfolder", type=str, default="vae", help="Subfolder containing VAE weights")
     parser.add_argument("--dim", type=int, default=256, help="Hidden dimension channel capacity")
@@ -350,8 +368,7 @@ Metrics Legend:
     print('Args:', args)
     device = args.device
 
-    diffusers_module = importlib.import_module("diffusers")
-    vae_cls = getattr(diffusers_module, args.vae)
+    vae_cls = resolve_vae_class(args.vae)
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float32
     print(f'Base VAE: cls={vae_cls} repo="{args.repo}" subfolder="{args.subfolder}"')
     vae_model = vae_cls.from_pretrained(args.repo, subfolder=args.subfolder, torch_dtype=dtype).to(device)
@@ -397,16 +414,6 @@ Metrics Legend:
         for i in range(0, len(images), args.batch):
             batch_img = images[i : i + args.batch].to(device=device, dtype=dtype)
             pbar.update(task, advance=batch_img.shape[0], message=f"Batch {i // args.batch + 1}")
-            # Check expected channels
-            expected_in_channels = getattr(vae_model.config, "in_channels", 3)
-            if batch_img.shape[1] < expected_in_channels:
-                pad_channels = expected_in_channels - batch_img.shape[1]
-                padding = torch.ones(
-                    (batch_img.shape[0], pad_channels, batch_img.shape[2], batch_img.shape[3]),
-                    device=device,
-                    dtype=dtype
-                )
-                batch_img = torch.cat([batch_img, padding], dim=1)
             lat = encode_vae(vae_model, batch_img)
             if latents_mean is not None and latents_std is not None:
                 mean_t = torch.tensor(latents_mean[:lat.shape[1]], device=lat.device, dtype=lat.dtype).view(1, -1, 1, 1)

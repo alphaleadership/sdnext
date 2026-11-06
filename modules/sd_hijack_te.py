@@ -1,6 +1,7 @@
 import os
 import time
 import contextlib
+from functools import wraps
 import torch
 from modules import shared, errors, timer, sd_models
 from modules.logger import log
@@ -34,9 +35,11 @@ class PromptCache:
             cached = None
         if cached:
             if isinstance(prompt, list):
-                log.debug(f'Encode: prompt={prompt} cache={len(self.cache)} hit')
+                length = sum(len(p) for p in prompt if isinstance(p, str))
+                log.debug(f'Encode: length={length} cache={len(self.cache)} prompt={prompt}')
             else:
-                log.debug(f'Encode: prompt="{prompt}" cache={len(self.cache)} hit')
+                length = len(prompt) if isinstance(prompt, str) else 0
+                log.debug(f'Encode: length={length} cache={len(self.cache)} prompt="{prompt}"')
         return cached
 
     def set(self, prompt, encoded, negative_prompt=None, cfg_enabled=None):
@@ -53,11 +56,21 @@ class PromptCache:
 prompt_cache = PromptCache()
 
 
-def encode_stance():
-    # sdnq compiles its helpers for static shapes, so a compiled encode recompiles for every new prompt length or image size and runs no faster once warm
-    if not shared.opts.torch_skip_compile_te or 'TE' in shared.opts.cuda_compile or not hasattr(torch.compiler, 'set_stance'): # an encoder compiled through compile model keeps its compile
+def compile_stance(target='TE'):
+    # SDNQ compiles static-shape helpers, so variable prompt lengths and image sizes can cause repeated recompiles without a warmup speedup
+    if not shared.opts.torch_skip_compile_te or target in shared.opts.cuda_compile or not hasattr(torch.compiler, 'set_stance'):
         return contextlib.nullcontext()
     return torch.compiler.set_stance('force_eager')
+
+
+def with_compile_stance(target='TE'):
+    def decorate(func):
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            with compile_stance(target):
+                return func(*args, **kwargs)
+        return wrapped
+    return decorate
 
 
 def hijack_encode_prompt(*args, **kwargs):
@@ -78,9 +91,9 @@ def hijack_encode_prompt(*args, **kwargs):
 
         if hasattr(shared.sd_model, 'before_prompt_encode'):
             log.debug('Encode: op=before')
-            res = shared.sd_model.before_prompt_encode(prompt)
+            prompt = shared.sd_model.before_prompt_encode(prompt)
             if patch_prompt:
-                args_copy[0] = res
+                args_copy[0] = prompt
 
         # cache key must include cfg-affecting kwargs since encode_prompt output may or may not include negative embeddings
         negative_prompt = kwargs.get('negative_prompt', None)
@@ -91,10 +104,12 @@ def hijack_encode_prompt(*args, **kwargs):
             res = cached
         else:
             if isinstance(prompt, list):
-                log.debug(f'Encode: prompt={prompt} hijack=True')
+                length = sum(len(p) for p in prompt if isinstance(p, str))
+                log.debug(f'Encode: length={length} prompt={prompt} hijack=True')
             else:
-                log.debug(f'Encode: prompt="{prompt}" hijack=True')
-            with attention_context.role('te'), encode_stance():
+                length = len(prompt) if isinstance(prompt, str) else 0
+                log.debug(f'Encode: length={length} prompt="{prompt}" hijack=True')
+            with attention_context.role('te'), compile_stance():
                 if hasattr(shared.sd_model, 'orig_encode_prompt'):
                     res = shared.sd_model.orig_encode_prompt(*args_copy, **kwargs)
                 else:

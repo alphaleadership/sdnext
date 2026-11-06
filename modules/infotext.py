@@ -9,12 +9,12 @@ if os.environ.get('SD_PASTE_DEBUG', None) is not None:
 else:
     debug = lambda *args, **kwargs: None # pylint: disable=unnecessary-lambda-assignment
 re_size = re.compile(r"^(\d+)x(\d+)$") # int x int
-re_param = re.compile(r'\s*([\w ]+):\s*("(?:\\"[^,]|\\"|\\|[^\"])+"|[^,]*)(?:,|$)') # multi-word: value
+re_param = re.compile(r'(?<![\w ])\s*(\w[\w ]*):\s*("(?:[^"\\]|\\.)+"|[^,]*)(?:,|$)', re.DOTALL) # multi-word: value; key start and quoted value must stay unambiguous or matching goes super-linear
 re_lora = re.compile("<lora:([^:]+):")
 
 
 def quote(text):
-    if ',' not in str(text) and '\n' not in str(text) and ':' not in str(text):
+    if ',' not in str(text) and '\n' not in str(text) and ':' not in str(text) and not str(text).lstrip().startswith('"'): # parse() reads a leading quote as an opening one
         return text
     return json.dumps(text, ensure_ascii=False)
 
@@ -75,7 +75,7 @@ def parse(infotext):
     for key, val in params.copy().items():
         val = unquote(val).strip(" ,\n").replace('\\\n', '')
         size = re_size.match(val)
-        if val.replace('.', '', 1).isdigit():
+        if val.replace('.', '', 1).isdecimal(): # isdigit also accepts superscripts that int() rejects
             params[key] = float(val) if '.' in val else int(val)
         elif val == "True":
             params[key] = True
@@ -109,7 +109,6 @@ mapping = [
     ('Color correction method', 'color_correction_method'),
     # Samplers
     ('Sampler eta delta', 'eta_noise_seed_delta'),
-    ('Sampler eta multiplier', 'initial_noise_multiplier'),
     ('Sampler timesteps', 'schedulers_timesteps'),
     ('Sampler spacing', 'schedulers_timestep_spacing'),
     ('Sampler sigma', 'schedulers_sigma'),
@@ -127,7 +126,6 @@ mapping = [
     ('Sampler max seq', 'schedulers_max_image_seq_len'),
     ('Sampler dynamic shift', 'schedulers_dynamic_shift'),
     # Token Merging
-    ('Mask weight', 'inpainting_mask_weight'),
     ('ToMe', 'tome_ratio'),
     ('ToDo', 'todo_ratio'),
 ]

@@ -1,7 +1,7 @@
 import os
 import gradio as gr
 from modules import timer, shared, paths, theme, sd_models, modelloader, generation_parameters_copypaste, call_queue, script_callbacks
-from modules import ui_common, ui_loadsave, ui_history, ui_storage, ui_components, ui_symbols
+from modules import ui_common, ui_loadsave, ui_history, ui_storage, ui_benchmark, ui_components, ui_symbols
 from modules.logger import log
 
 
@@ -307,6 +307,10 @@ def create_ui(disabled_tabs=None):
             with gr.TabItem("Storage", id="system_storage", elem_id="tab_storage"):
                 ui_storage.create_ui()
 
+        if 'benchmark' not in disabled_tabs:
+            with gr.TabItem("Benchmark", id="system_benchmark", elem_id="tab_benchmark"):
+                ui_benchmark.create_ui()
+
         if 'monitor' not in disabled_tabs:
             with gr.TabItem("GPU Monitor", id="system_gpu", elem_id="tab_gpu"):
                 with gr.Row(elem_id='gpu-controls'):
@@ -332,7 +336,7 @@ def create_ui(disabled_tabs=None):
     if request_notifications:
         request_notifications.click(fn=lambda: None, inputs=[], outputs=[], _js='function(){}')
     settings_submit.click(
-        fn=call_queue.wrap_gradio_call(run_settings, extra_outputs=[gr.update()]),
+        fn=call_queue.wrap_gradio_call(run_settings, extra_outputs=[gr.update()], track_state=False),
         inputs=components,
         outputs=[text_settings, result],
     )
@@ -343,8 +347,8 @@ def create_ui(disabled_tabs=None):
 def reset_quicksettings(quick_components):
     quick_components = quick_components.split(',')
     updates = []
+    log.warning(f'Reset: settings={quick_components}')
     for key in quick_components:
-        log.warning(f'Reset: setting={key}')
         updates.append(gr.update(value=shared.opts.get_default(key)))
     return updates
 

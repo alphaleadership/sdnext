@@ -30,8 +30,8 @@ def dirname(path_: str, r: int = 1) -> str:
     return path_
 
 
-def spawn(command: str | list[str], cwd: os.PathLike = '.') -> str:
-    process = subprocess.run(command, cwd=cwd, shell=True, check=False, capture_output=True, text=True)
+def spawn(command: str | list[str], cwd: os.PathLike = '.', env: dict[str, str] | None = None) -> str:
+    process = subprocess.run(command, cwd=cwd, shell=True, check=False, capture_output=True, text=True, env=env)
     return process.stdout
 
 
@@ -54,6 +54,7 @@ class ROCmEnvironment(Environment):
 # rocm-sdk package is installed
 class PythonPackageEnvironment(Environment):
     hip: ctypes.CDLL
+    path: str
 
     def __init__(self, rocm_sdk_module: ModuleType):
         spec = rocm_sdk_module._dist_info.ALL_PACKAGES['core'].get_py_package() # pylint: disable=protected-access
@@ -62,6 +63,7 @@ class PythonPackageEnvironment(Environment):
         candidates = glob.glob(pattern)
         if len(candidates) == 0:
             raise FileNotFoundError("Could not find amdhip64 in rocm-sdk package")
+        self.path = os.path.dirname(candidates[0])
         self.hip = ctypes.CDLL(candidates[0])
 
 
@@ -70,12 +72,17 @@ class MicroArchitecture(Enum):
     RDNA = "rdna"
     CDNA = "cdna"
 
+xnack_arches = frozenset({
+    0x906, 0x908, 0x909, 0x90a, 0x90c,
+    0x940, 0x941, 0x942, 0x950,
+})
 
 class Agent:
     name: str
     gfx_version: int
     arch: MicroArchitecture
     is_apu: bool
+    rocblas_supported: bool
     blaslt_supported: bool
 
     @staticmethod
@@ -114,22 +121,28 @@ class Agent:
             self.arch = MicroArchitecture.GCN
         self.is_apu = (self.gfx_version & 0xFFF0 == 0x1150) or self.gfx_version in (0x801, 0x902, 0x90c, 0x1013, 0x1033, 0x1035, 0x1036, 0x1103,)
         blaslt_filename = f"TensileLibrary_lazy_{self.name}.dat"
-        if blaslt_tensile_libpath is None:
-            self.blaslt_supported = False
-        else:
+
+        def has_tensile_library(path: str | None) -> bool:
+            if path is None:
+                return False
             search_paths = (
-                os.path.join(blaslt_tensile_libpath, blaslt_filename),
-                os.path.join(blaslt_tensile_libpath, blaslt_filename + ".zlib"),
-                os.path.join(blaslt_tensile_libpath, self.name, blaslt_filename),
-                os.path.join(blaslt_tensile_libpath, self.name, blaslt_filename + ".zlib"),
+                os.path.join(path, blaslt_filename),
+                os.path.join(path, blaslt_filename + ".zlib"),
+                os.path.join(path, self.name, blaslt_filename),
+                os.path.join(path, self.name, blaslt_filename + ".zlib"),
             )
-            self.blaslt_supported = any(os.path.exists(p) for p in search_paths)
+            return any(os.path.exists(p) for p in search_paths)
+
+        rocblas_path = os.environ.get("ROCBLAS_TENSILE_LIBPATH") or rocblas_tensile_libpath
+        hipblaslt_path = os.environ.get("HIPBLASLT_TENSILE_LIBPATH") or blaslt_tensile_libpath
+        self.rocblas_supported = has_tensile_library(rocblas_path) and (0x1010 <= self.gfx_version <= 0x1036 or self.gfx_version >= 0x1100)
+        self.blaslt_supported = self.gfx_version >= 0x1100 and has_tensile_library(hipblaslt_path)
 
     def __str__(self) -> str:
         return self.name
 
     def __repr__(self) -> str:
-        return f"Agent(name={self.name} gfx={hex(self.gfx_version)} arch={self.arch} apu={self.is_apu} blaslt={self.blaslt_supported})"
+        return f"Agent(name={self.name} gfx={hex(self.gfx_version)} arch={self.arch} apu={self.is_apu} rocblas={self.rocblas_supported} blaslt={self.blaslt_supported})"
 
     @property
     def therock(self) -> str | None:
@@ -143,12 +156,20 @@ class Agent:
             return None
         if self.gfx_version >= 0x1100 and self.gfx_version < 0x1200:
             return "11.0.0"
-        elif self.gfx_version != 0x1030 and self.gfx_version >= 0x1000 and self.gfx_version < 0x1100:
-            # gfx1010 users had to override gfx version to 10.3.0 in Linux
-            # it is unknown whether overriding is needed in ZLUDA
+        elif self.gfx_version == 0x1010:
+            return "10.1.0"
+        elif self.gfx_version != 0x1030 and self.gfx_version > 0x1000 and self.gfx_version < 0x1100:
+            # Some gfx10xx users may need to override the version to 10.3.0.
+            # It is unknown whether overriding is needed in ZLUDA.
             return "10.3.0"
         return None
 
+
+def configure_xnack(agents: list[Agent]):
+    unsupported = [agent.name for agent in agents if agent.gfx_version not in xnack_arches]
+    if unsupported:
+        os.environ.pop('HSA_XNACK', None)
+        log.info(f'ROCm: XNACK is Null for unsupported {unsupported}')
 
 def find() -> ROCmEnvironment | None:
     hip_path = shutil.which("hipconfig")
@@ -237,7 +258,7 @@ def get_flash_attention_command(agent: Agent) -> str:
 
 
 def refresh():
-    global rocm_sdk, environment, blaslt_tensile_libpath, is_installed, version # pylint: disable=global-statement
+    global rocm_sdk, environment, rocblas_tensile_libpath, blaslt_tensile_libpath, is_installed, version # pylint: disable=global-statement
     try:
         import rocm_sdk as rocm_sdk_module
         rocm_sdk = rocm_sdk_module
@@ -245,18 +266,24 @@ def refresh():
         try:
             target_family = rocm_sdk._dist_info.determine_target_family() # pylint: disable=protected-access
             spec = rocm_sdk._dist_info.ALL_PACKAGES['libraries'].get_py_package(target_family) # pylint: disable=protected-access
-            blaslt_tensile_libpath = os.path.join(os.path.dirname(spec.origin), "bin", "hipblaslt", "library")
+            library_path = os.path.join(os.path.dirname(spec.origin), "bin")
+            rocblas_tensile_libpath = os.path.join(library_path, "rocblas", "library")
+            blaslt_tensile_libpath = os.path.join(library_path, "hipblaslt", "library")
         except Exception:
+            rocblas_tensile_libpath = None
             blaslt_tensile_libpath = None
         spawn(["rocm-sdk", "init"])
     except ImportError:
         rocm_sdk = None
         environment = find()
         if environment is not None:
-            blaslt_tensile_libpath = os.path.join(environment.path, "bin" if sys.platform == "win32" else "lib", "hipblaslt", "library")
+            library_path = os.path.join(environment.path, "bin" if sys.platform == "win32" else "lib")
+            rocblas_tensile_libpath = os.path.join(library_path, "rocblas", "library")
+            blaslt_tensile_libpath = os.path.join(library_path, "hipblaslt", "library")
 
     if environment is not None:
-        blaslt_tensile_libpath = os.environ.get("HIPBLASLT_TENSILE_LIBPATH", blaslt_tensile_libpath)
+        rocblas_tensile_libpath = os.environ.get("ROCBLAS_TENSILE_LIBPATH") or rocblas_tensile_libpath
+        blaslt_tensile_libpath = os.environ.get("HIPBLASLT_TENSILE_LIBPATH") or blaslt_tensile_libpath
         is_installed = True
         version = get_version()
 
@@ -270,12 +297,20 @@ if sys.platform == "win32":
             name = f.name
             f.write(CODE_AMDGPU_ARCH)
             f.flush()
-        out = spawn([sys.executable, name])
+        # newer drivers ship amdhip64 that depends on sdk dlls such as rocm_kpack.dll
+        env = os.environ.copy()
+        if isinstance(environment, PythonPackageEnvironment):
+            env["PATH"] = os.path.join(environment.path, env.get("PATH", ""))
+        elif isinstance(environment, ROCmEnvironment):
+            env["PATH"] = os.path.join(environment.path, "bin", env.get("PATH", ""))
+        out = spawn([sys.executable, name], env=env)
         os.unlink(name)
         out = out.strip()
         if out == "":
             return []
-        return [Agent(x.split(' ')[-1].strip()) for x in out.split("\n")]
+        agents = [Agent(x.split(' ')[-1].strip()) for x in out.split("\n")]
+        configure_xnack(agents)
+        return agents
 
     def postinstall():
         import torch
@@ -348,7 +383,9 @@ else: # sys.platform != "win32"
         except Exception: # old version of ROCm WSL doesn't have rocm_agent_enumerator
             _agents = spawn("rocminfo").split("\n")
             _agents = [x.strip().split(" ")[-1] for x in _agents if x.startswith('  Name:') and "CPU" not in x]
-        return [Agent(x) for x in _agents]
+        agents = [Agent(x) for x in _agents]
+        configure_xnack(agents)
+        return agents
 
     def postinstall():
         if is_wsl:
@@ -375,6 +412,7 @@ else: # sys.platform != "win32"
     is_wsl: bool = os.environ.get('WSL_DISTRO_NAME', 'unknown' if spawn('wslpath -w /') else None) is not None
 
 environment: Environment | None = None
+rocblas_tensile_libpath: str | None = None
 blaslt_tensile_libpath: str | None = None
 is_installed: bool = False
 version: str | None = None
