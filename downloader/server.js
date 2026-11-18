@@ -762,6 +762,46 @@ function pushZipToArchive(filePath, fileName, seq) {
   return `parts/${destName}`;
 }
 
+// ============================================================
+// STAGING DU ZIP ASCII — le zip cumulatif vit dans zipwork/ (hors
+// dossiers surveillés, donc jamais listé dans /api/tosend ni envoyé
+// comme fichier individuel) ; il est pushé sur le repo d'archive
+// après une rafale de .txt (debounce ARCHIVE_PUSH_DELAY_MS).
+// ============================================================
+
+const ZIPWORK_DIR = path.join(__dirname, 'zipwork');
+const ASCII_ZIP_PATH = path.join(ZIPWORK_DIR, ASCII_ZIP_NAME);
+const ARCHIVE_PUSH_DELAY_MS = Number(process.env.ARCHIVE_PUSH_DELAY_MS) || 30000;
+let archivePushTimer = null;
+
+function scheduleArchivePush() {
+  if (!ARCHIVE_REPO) return; // archivage désactivé : le zip reste en local
+  if (archivePushTimer) clearTimeout(archivePushTimer);
+  archivePushTimer = setTimeout(() => {
+    archivePushTimer = null;
+    if (!fs.existsSync(ASCII_ZIP_PATH)) return;
+    const seq = nextSeq();
+    try {
+      const bytes = fs.statSync(ASCII_ZIP_PATH).size;
+      const repoPath = pushZipToArchive(ASCII_ZIP_PATH, ASCII_ZIP_NAME, seq);
+      fs.rmSync(ASCII_ZIP_PATH); // le prochain .txt repart d'un zip neuf
+      counter = saveCounter({
+        count: Math.max(counter.count, seq),
+        lastFile: `${ARCHIVE_REPO}/${repoPath}`,
+        lastSentAt: new Date().toISOString(),
+      });
+      sentHistory.push({ seq, name: repoPath, original: ASCII_ZIP_NAME, bytes, at: new Date().toISOString() });
+      if (sentHistory.length > SENT_HISTORY_LIMIT) sentHistory.shift();
+      broadcastStatus();
+      log(`Zip ${ASCII_ZIP_NAME} (${formatBytes(bytes)}) archivé sur ${ARCHIVE_REPO} : ${repoPath} [envoi #${seq}]`, 'ok');
+    } catch (e) {
+      // le zip reste en staging : réessayé au prochain .txt
+      log(`Push auto de ${ASCII_ZIP_NAME} vers ${ARCHIVE_REPO} impossible : ${e.message}`, 'error');
+    }
+  }, ARCHIVE_PUSH_DELAY_MS);
+  if (archivePushTimer.unref) archivePushTimer.unref();
+}
+
 // Nom de fichier sûr : basename uniquement (pas de traversal), caractères
 // limités, extension dans la whitelist du watcher
 function safeUploadName(rawName) {
@@ -938,9 +978,10 @@ function logAsciiPreview(fileName, imageBuffer,seq) {
       dest = saveAsciiPreview(`${seq}-${fileName}`, full);
       // Prévient le visionneur web qu'un nouvel aperçu est disponible
       broadcast({ type: 'ascii', name: path.basename(dest) });
-      // Archive automatiquement l'aperçu dans le zip d'envoi (tosend/ascii.zip)
+      // Archive automatiquement l'aperçu dans le zip cumulatif (zipwork/, hors tosend)
       try {
-        addFileToZip(path.join(TOSEND_DIR, ASCII_ZIP_NAME), dest, path.basename(dest));
+        addFileToZip(ASCII_ZIP_PATH, dest, path.basename(dest));
+        scheduleArchivePush();
       } catch (e) {
         log(`Ajout de l'aperçu au zip impossible : ${e.message}`, 'warn');
       }
@@ -1084,9 +1125,10 @@ async function processFile(filePath) {
     if (path.extname(filePath).toLowerCase() === '.txt') {
         const txtName = path.basename(filePath);
         try {
-            const added = addFileToZip(path.join(TOSEND_DIR, ASCII_ZIP_NAME), filePath, txtName);
+            const added = addFileToZip(ASCII_ZIP_PATH, filePath, txtName);
             fs.rmSync(filePath);
-            log(added ? `${txtName} ajouté au zip ${ASCII_ZIP_NAME}` : `${txtName} déjà présent dans ${ASCII_ZIP_NAME}, ignoré`, 'ok');
+            log(added ? `${txtName} ajouté au zip ${ASCII_ZIP_NAME} (staging zipwork/)` : `${txtName} déjà présent dans ${ASCII_ZIP_NAME}, ignoré`, 'ok');
+            scheduleArchivePush();
             broadcastStatus();
         } catch (e) {
             log(`Ajout de ${txtName} au zip impossible : ${e.message}`, 'error');

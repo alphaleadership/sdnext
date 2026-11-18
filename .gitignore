@@ -83,3 +83,4 @@ downloader/model.txt
 downloader/send-counter.json
 downloader/ascii/
 downloader/.archive/
+downloader/zipwork/
