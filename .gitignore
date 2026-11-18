@@ -81,3 +81,5 @@ downloader/tosend/
 downloader/sortie.txt
 downloader/model.txt
 downloader/send-counter.json
+downloader/ascii/
+downloader/.archive/

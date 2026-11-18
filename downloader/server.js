@@ -466,7 +466,7 @@ const EMAIL_TO         = process.env.dest;
 const WATCH_FOLDER     = ['E:\\sdnext\\outputs',"./tosend","./generated"];
 const POLL_INTERVAL_MS = 3000; // vérifie toutes les 3 secondes
 // Extensions à surveiller
-const EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', ".pdf", ".zip"];
+const EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', ".pdf", ".zip", ".txt"];
 
 // Types MIME corrects pour l'envoi par email (le .pdf partait en image/png)
 const MIME_TYPES = {
@@ -476,6 +476,7 @@ const MIME_TYPES = {
   '.webp': 'image/webp',
   '.pdf': 'application/pdf',
   '.zip': 'application/zip',
+  '.txt': 'text/plain',
 };
 const SEND_EXISTING    = true;
 // ============================================================
@@ -576,6 +577,190 @@ app.get('/api/status', (req, res) => {
 const TOSEND_DIR = path.join(__dirname, 'tosend');
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB) || 200;
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
+
+// ============================================================
+// ZIP AUTOMATIQUE DES .TXT — ajout incrémental sans dépendance
+// (CRC32 + deflate via zlib, central directory réécrit proprement,
+// écriture atomique tmp + rename). Les .txt détectés sont archivés
+// dans tosend/ascii.zip au lieu d'être envoyés un par un ; le zip est
+// ensuite envoyé par le watcher comme n'importe quel .zip, puis supprimé
+// après envoi — le prochain .txt recrée un zip neuf.
+// ============================================================
+
+const zlib = require('zlib');
+
+const ASCII_ZIP_NAME = 'ascii.zip'; // zip cumulatif déposé dans tosend
+
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(buf) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+function dosDateTime(date) {
+  const time = ((date.getHours() & 0x1F) << 11) | ((date.getMinutes() & 0x3F) << 5) | ((date.getSeconds() >> 1) & 0x1F);
+  const day = (((date.getFullYear() - 1980) & 0x7F) << 9) | (((date.getMonth() + 1) & 0xF) << 5) | (date.getDate() & 0x1F);
+  return { time, day };
+}
+
+// Ajoute filePath dans zipPath sous le nom arcName.
+// Retourne true si ajouté, false si le nom existait déjà.
+function addFileToZip(zipPath, filePath, arcName) {
+  const data = fs.readFileSync(filePath);
+  const nameBuf = Buffer.from(arcName, 'utf8');
+  const crc = crc32(data);
+  const compressed = zlib.deflateRawSync(data, { level: 6 });
+  const { time, day } = dosDateTime(new Date());
+  const FLAG_UTF8 = 0x0800;
+
+  let body = Buffer.alloc(0); // local headers + data existants
+  const entries = [];         // entrées du central directory
+  if (fs.existsSync(zipPath)) {
+    const existing = fs.readFileSync(zipPath);
+    let eocd = -1;
+    const min = Math.max(0, existing.length - 22 - 65536);
+    for (let i = existing.length - 22; i >= min; i--) {
+      if (existing.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error('zip corrompu (EOCD introuvable)');
+    const count = existing.readUInt16LE(eocd + 10);
+    const cdOffset = existing.readUInt32LE(eocd + 16);
+    let p = cdOffset;
+    for (let e = 0; e < count; e++) {
+      if (existing.readUInt32LE(p) !== 0x02014b50) throw new Error('zip corrompu (central directory)');
+      const nameLen = existing.readUInt16LE(p + 28);
+      entries.push({
+        time: existing.readUInt16LE(p + 12),
+        day: existing.readUInt16LE(p + 14),
+        crc: existing.readUInt32LE(p + 16),
+        csize: existing.readUInt32LE(p + 20),
+        usize: existing.readUInt32LE(p + 24),
+        name: existing.toString('utf8', p + 46, p + 46 + nameLen),
+        offset: existing.readUInt32LE(p + 42),
+      });
+      p += 46 + nameLen + existing.readUInt16LE(p + 30) + existing.readUInt16LE(p + 32);
+    }
+    if (entries.some(en => en.name === arcName)) return false; // déjà archivé
+    body = existing.subarray(0, cdOffset);
+  }
+
+  // nouveau local file header + data
+  const lfh = Buffer.alloc(30);
+  lfh.writeUInt32LE(0x04034b50, 0);
+  lfh.writeUInt16LE(20, 4);          // version needed
+  lfh.writeUInt16LE(FLAG_UTF8, 6);   // noms en UTF-8
+  lfh.writeUInt16LE(8, 8);           // deflate
+  lfh.writeUInt16LE(time, 10);
+  lfh.writeUInt16LE(day, 12);
+  lfh.writeUInt32LE(crc, 14);
+  lfh.writeUInt32LE(compressed.length, 18);
+  lfh.writeUInt32LE(data.length, 22);
+  lfh.writeUInt16LE(nameBuf.length, 26);
+  lfh.writeUInt16LE(0, 28);
+  const newEntry = { name: arcName, crc, csize: compressed.length, usize: data.length, offset: body.length, time, day };
+  body = Buffer.concat([body, lfh, nameBuf, compressed]);
+  entries.push(newEntry);
+
+  // central directory
+  const cdParts = [];
+  for (const en of entries) {
+    const nb = Buffer.from(en.name, 'utf8');
+    const cde = Buffer.alloc(46);
+    cde.writeUInt32LE(0x02014b50, 0);
+    cde.writeUInt16LE(20, 4);
+    cde.writeUInt16LE(20, 6);
+    cde.writeUInt16LE(FLAG_UTF8, 8);
+    cde.writeUInt16LE(8, 10);
+    cde.writeUInt16LE(en.time, 12);
+    cde.writeUInt16LE(en.day, 14);
+    cde.writeUInt32LE(en.crc, 16);
+    cde.writeUInt32LE(en.csize, 20);
+    cde.writeUInt32LE(en.usize, 24);
+    cde.writeUInt16LE(nb.length, 28);
+    cde.writeUInt16LE(0, 30);
+    cde.writeUInt16LE(0, 32);
+    cde.writeUInt16LE(0, 34);
+    cde.writeUInt16LE(0, 36);
+    cde.writeUInt32LE(0, 38);
+    cde.writeUInt32LE(en.offset, 42);
+    cdParts.push(cde, nb);
+  }
+  const cd = Buffer.concat(cdParts);
+
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0);
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(entries.length, 8);
+  eocd.writeUInt16LE(entries.length, 10);
+  eocd.writeUInt32LE(cd.length, 12);
+  eocd.writeUInt32LE(body.length, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  const out = Buffer.concat([body, cd, eocd]);
+  fs.mkdirSync(path.dirname(zipPath), { recursive: true });
+  const tmp = zipPath + '.tmp';
+  fs.writeFileSync(tmp, out);
+  fs.renameSync(tmp, zipPath); // atomique : le watcher ne lit jamais un zip partiel
+  return true;
+}
+
+// ============================================================
+// ARCHIVE GIT — les .zip ne partent plus par email : ils sont
+// automatiquement ajoutés (commit + push) au repo d'archive GitHub,
+// dans parts/ sous un nom numéroté. ARCHIVE_REPO vide = désactivé
+// (retour à l'envoi par email pour les .zip).
+// ============================================================
+
+const { execFileSync } = require('child_process');
+
+const ARCHIVE_REPO = process.env.ARCHIVE_REPO !== undefined
+  ? process.env.ARCHIVE_REPO
+  : 'alphaleadership/sdnext-ascii-archive';
+const ARCHIVE_DIR = process.env.ARCHIVE_DIR
+  ? path.resolve(process.env.ARCHIVE_DIR)
+  : path.join(__dirname, '.archive');
+const GIT_ENV = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+
+function git(args, cwd) {
+  return execFileSync('git', args, { cwd, env: GIT_ENV, stdio: ['ignore', 'pipe', 'pipe'] }).toString();
+}
+
+// Clone le repo d'archive si besoin, y copie le zip dans parts/ puis commit + push.
+// Retourne le chemin du fichier dans le repo (ex: parts/1476_ascii.zip).
+function pushZipToArchive(filePath, fileName, seq) {
+  if (!ARCHIVE_REPO) throw new Error('ARCHIVE_REPO non configuré');
+  const repoUrl = `https://github.com/${ARCHIVE_REPO}.git`;
+  if (!fs.existsSync(path.join(ARCHIVE_DIR, '.git'))) {
+    fs.mkdirSync(path.dirname(ARCHIVE_DIR), { recursive: true });
+    git(['clone', repoUrl, ARCHIVE_DIR], path.dirname(ARCHIVE_DIR));
+    log(`Clone du repo d'archive : ${ARCHIVE_REPO} -> ${ARCHIVE_DIR}`, 'info');
+  } else {
+    try { git(['-C', ARCHIVE_DIR, 'pull', '--ff-only'], ARCHIVE_DIR); } catch (_) { /* offline : on tente quand même le push */ }
+  }
+  const partsDir = path.join(ARCHIVE_DIR, 'parts');
+  fs.mkdirSync(partsDir, { recursive: true });
+  const destName = `${String(seq).padStart(4, '0')}_${fileName}`;
+  fs.copyFileSync(filePath, path.join(partsDir, destName));
+  git(['-C', ARCHIVE_DIR, 'add', '-A'], ARCHIVE_DIR);
+  const status = git(['-C', ARCHIVE_DIR, 'status', '--porcelain'], ARCHIVE_DIR).trim();
+  if (status) {
+    git(['-C', ARCHIVE_DIR, '-c', 'user.email=alphaleadership@users.noreply.github.com', '-c', 'user.name=alphaleadership',
+      'commit', '-m', `Ajout automatique : ${destName}`], ARCHIVE_DIR);
+  }
+  git(['-C', ARCHIVE_DIR, 'push', 'origin', 'HEAD'], ARCHIVE_DIR);
+  return `parts/${destName}`;
+}
 
 // Nom de fichier sûr : basename uniquement (pas de traversal), caractères
 // limités, extension dans la whitelist du watcher
@@ -753,6 +938,12 @@ function logAsciiPreview(fileName, imageBuffer,seq) {
       dest = saveAsciiPreview(`${seq}-${fileName}`, full);
       // Prévient le visionneur web qu'un nouvel aperçu est disponible
       broadcast({ type: 'ascii', name: path.basename(dest) });
+      // Archive automatiquement l'aperçu dans le zip d'envoi (tosend/ascii.zip)
+      try {
+        addFileToZip(path.join(TOSEND_DIR, ASCII_ZIP_NAME), dest, path.basename(dest));
+      } catch (e) {
+        log(`Ajout de l'aperçu au zip impossible : ${e.message}`, 'warn');
+      }
     } catch (e) {
       log(`Sauvegarde de l'aperçu ASCII impossible : ${e.message}`, 'warn');
     }
@@ -884,7 +1075,57 @@ async function processFile(filePath) {
     if (!isReady) {
         log(`Le fichier ${path.basename(filePath)} semble toujours en cours d'écriture. On réessaiera plus tard.`, 'warn');
         // IMPORTANT : On retire du Set 'seen' pour que le prochain scan puisse le retrouver
-        seen.delete(filePath); 
+        seen.delete(filePath);
+        return;
+    }
+
+    // Les .txt ne partent pas un par un : ils sont ajoutés au zip cumulatif
+    // tosend/ascii.zip, que le watcher enverra ensuite comme un .zip normal.
+    if (path.extname(filePath).toLowerCase() === '.txt') {
+        const txtName = path.basename(filePath);
+        try {
+            const added = addFileToZip(path.join(TOSEND_DIR, ASCII_ZIP_NAME), filePath, txtName);
+            fs.rmSync(filePath);
+            log(added ? `${txtName} ajouté au zip ${ASCII_ZIP_NAME}` : `${txtName} déjà présent dans ${ASCII_ZIP_NAME}, ignoré`, 'ok');
+            broadcastStatus();
+        } catch (e) {
+            log(`Ajout de ${txtName} au zip impossible : ${e.message}`, 'error');
+        }
+        seen.delete(filePath);
+        return;
+    }
+
+    // Les .zip sont archivés sur le repo GitHub (commit + push) au lieu d'être
+    // envoyés par email. En cas d'échec : déplacement vers failed/ comme un envoi.
+    if (path.extname(filePath).toLowerCase() === '.zip' && ARCHIVE_REPO) {
+        const zipName = path.basename(filePath);
+        const seq = nextSeq();
+        try {
+            const repoPath = pushZipToArchive(filePath, zipName, seq);
+            counter = saveCounter({
+                count: Math.max(counter.count, seq),
+                lastFile: `${ARCHIVE_REPO}/${repoPath}`,
+                lastSentAt: new Date().toISOString(),
+            });
+            sentHistory.push({ seq, name: repoPath, original: zipName, bytes: fs.statSync(filePath).size, at: new Date().toISOString() });
+            if (sentHistory.length > SENT_HISTORY_LIMIT) sentHistory.shift();
+            broadcastStatus();
+            log(`Zip archivé sur le repo ${ARCHIVE_REPO} : ${repoPath} [envoi #${seq}]`, 'ok');
+            fs.rmSync(filePath);
+        } catch (e) {
+            log(`Archivage git de ${zipName} impossible : ${e.message}`, 'error');
+            const errorDir = path.join(__dirname, 'failed');
+            if (!fs.existsSync(errorDir)) fs.mkdirSync(errorDir);
+            const destPath = path.join(errorDir, zipName);
+            try {
+                if (fs.existsSync(destPath)) fs.rmSync(destPath);
+                fs.renameSync(filePath, destPath);
+                log(`Fichier déplacé vers ${errorDir}`, 'warn');
+            } catch (moveErr) {
+                log(`Critique : Impossible de déplacer le fichier : ${moveErr.message}`, 'error');
+            }
+        }
+        seen.delete(filePath);
         return;
     }
 
