@@ -3,12 +3,18 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
     "express": "^4.19.2",
     "https-proxy-agent": "^7.0.4",
+    "jpeg-js": "^0.4.4",
+    "morgan": "^1.12.1",
     "resend": "^6.28.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
   }
 }

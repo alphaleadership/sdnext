@@ -6,7 +6,7 @@ const dotenv=require("dotenv")
 // CONFIG
 // ============================================================
 const SDNEXT_URL   = 'http://localhost:7860';
-const OUTPUT_DIR   = './generated';  // dossier local où sauvegarder les images
+const OUTPUT_DIR   = './tosend';  // dossier local où sauvegarder les images
 // ============================================================
 
 function log(msg) {
@@ -113,7 +113,7 @@ async function txt2img(params) {
     height: 512,
     batch_size: 1,
     n_iter: 1,
-    sampler_name: 'Euler a',
+   
     save_images: true,
     ...params,
   };
@@ -155,18 +155,18 @@ async function main() {
     // Afficher le modèle actuel
     const current = await getCurrentModel();
     log(`Modèle actuel : ${current}`);
-    /*
+    const prompt=fs.readFileSync("../params.txt","utf-8").split("\n")[0]
     // Générer une image
     await txt2img({
-      prompt: 'a kitsune with bikini, at the beach , photorealistic, 8k',
+      prompt: prompt,
       negative_prompt: 'blurry, low quality, watermark',
-      steps: 30,
+      steps: 10,
       cfg_scale: 7,
-      batch_size: 4,
+      n_iter: 40,
       width: 1024,
       height: 1024,
      
-    });*/
+    });
     await watchProgress()
     // Exemple : générer plusieurs images en batch
     // await txt2img({

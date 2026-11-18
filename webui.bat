@@ -99,7 +99,7 @@ type tmp\stdout.txt
 
 :show_stderr
 for /f %%i in ("tmp\stderr.txt") do set size=%%~zi
-if %size% equ 0 goto :show_stderr
+if %size% equ 0 goto :endofscript
 echo.
 echo stderr:
 type tmp\stderr.txt

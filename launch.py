@@ -78,7 +78,12 @@ def get_custom_args():
 
 
 @lru_cache
-def commit_hash(): # compatibility function
+def git_tag(): # compatibility function for extensions
+    try:
+        return run(f"{git} describe --tags --always").strip()
+    except Exception:
+        return "<none>"
+
     global stored_commit_hash # pylint: disable=global-statement
     if stored_commit_hash is not None:
         return stored_commit_hash

@@ -182,6 +182,28 @@ except Exception as e:
     report(f'transformers=={transformers.__version__ if "transformers" in sys.modules else None}', e)
 timer.startup.record("transformers")
 
+try: # transformers 5.x re-executes its package init on first processing utils use and replaces sys.modules['transformers']
+    import transformers.processing_utils # pylint: disable=W0611,C0411
+except Exception:
+    pass
+
+def patch_transformers(): # transformers 5.x removed flax support and MT5Tokenizer, but pinned diffusers still imports them
+    try:
+        import transformers.utils as _tf_utils
+        if not hasattr(_tf_utils, 'FLAX_WEIGHTS_NAME'):
+            _tf_utils.FLAX_WEIGHTS_NAME = 'flax_model.msgpack'
+    except Exception:
+        pass
+    try:
+        _tf = sys.modules['transformers']
+        if not hasattr(_tf, 'MT5Tokenizer'):
+            from transformers import T5Tokenizer as _T5Tokenizer
+            _tf.MT5Tokenizer = _T5Tokenizer
+    except Exception:
+        pass
+
+patch_transformers()
+
 try:
     import onnxruntime as ort# pylint: disable=W0611,C0411
     ort.set_default_logger_severity(4)
@@ -220,6 +242,7 @@ except Exception as e:
     errors.display(e, 'diffusers')
     sys.exit(1)
 timer.startup.record("diffusers")
+patch_transformers() # re-apply in case importing diffusers replaced sys.modules['transformers']
 
 from installer import register_sdnq
 register_sdnq()

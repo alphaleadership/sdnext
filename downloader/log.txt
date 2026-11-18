@@ -1,0 +1,4 @@
+[16:29:54] Modèle actuel : Diffusers\CalamitousFelicitousness/Anima-1.0-Aesthetic-Diffusers [7ff3efed35]
+[16:29:54] Génération : "a wolf girl ,bikini, star wars universe "
+[16:29:54] Paramètres : 1024x1024 — 10 steps — CFG 7
+
