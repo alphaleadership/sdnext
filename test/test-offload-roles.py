@@ -21,6 +21,7 @@ Covers:
 - a settings change re-placing a previously resident component
 - ``apply_group_offload_ondemand`` return contract and idempotency
 - leaf group offload moving each transformers ``_no_split_modules`` unit as one group
+- block level group offload serving a TeaCache read of the first block's norm from outside the block, with and without streams
 - ``get_module_names`` on both pipeline kinds
 - the upstream markers the roles read
 - an inventory audit deriving the role of every component of every registered pipeline,
@@ -496,6 +497,32 @@ def test_ondemand_offload_hands_back_the_loaded_tensors():
     return True
 
 
+def test_hook_removal_hands_an_onloaded_module_back():
+    device = accelerator()
+    if device is None:
+        return True
+    module = BridgeModule()
+    sd_offload_group.apply_group_offload_ondemand(module)
+    loaded = {name: p.data for name, p in module.named_parameters()}
+    pipe = FakePipe({'vae': module})
+    pipe.sdnext_ondemand_modules = ['vae']
+    allocated = torch.cuda.memory_allocated(device)
+    orig_device = sd_offload_group.devices.device
+    sd_offload_group.devices.device = device
+    try:
+        module._hf_hook.pre_forward(module, torch.zeros(1, 4)) # pylint: disable=protected-access # a decode that raises after its entry hook leaves the module onloaded with its record
+        sd_offload_group.remove_group_offload(pipe) # an unload removes the hooks, then moves the module to meta
+        module.to('meta')
+    finally:
+        sd_offload_group.devices.device = orig_device
+    leaked = torch.cuda.memory_allocated(device) - allocated
+    assert leaked == 0, f'{leaked} bytes stay on the accelerator after the meta move'
+    assert getattr(module, 'sdnext_loaded', None) is None, 'the record must not outlive the hook'
+    for name, tensor in loaded.items():
+        assert tensor.device.type == 'cpu', f'{name} record entry is not the cpu tensor'
+    return True
+
+
 def test_group_offload_hands_back_the_loaded_tensors():
     from diffusers.hooks.group_offloading import _GROUP_OFFLOADING
     device = accelerator()
@@ -584,6 +611,74 @@ def test_group_offload_keeps_no_split_units_whole():
     assert torch.allclose(output, expected, atol=1e-3), 'the offloaded encode must match the cpu encode'
     assert next(module.parameters()).device.type == 'cpu', 'the units must return to cpu after the forward'
     return True
+
+
+class TeaCacheBlock(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.norm1 = torch.nn.Linear(4, 4)
+        self.ff = torch.nn.Linear(4, 4)
+
+    def forward(self, x):
+        return self.ff(self.norm1(x))
+
+
+class TeaCacheTransformer(torch.nn.Module):
+    """Denoiser that reads the first block's norm1 from its own forward, as the TeaCache ports do."""
+    def __init__(self):
+        super().__init__()
+        self.enable_teacache = True
+        self.proj_in = torch.nn.Linear(4, 4)
+        self.transformer_blocks = torch.nn.ModuleList([TeaCacheBlock(), TeaCacheBlock(), TeaCacheBlock()])
+        self.modulated = None
+
+    def forward(self, x):
+        x = self.proj_in(x)
+        if self.enable_teacache:
+            self.modulated = self.transformer_blocks[0].norm1(x)
+        for block in self.transformer_blocks:
+            x = block(x)
+        return x
+
+
+def block_level_teacache(stream: bool):
+    """Two forwards of the TeaCache-shaped denoiser under block level group offload, against the cpu forward."""
+    device = accelerator()
+    if device is None:
+        return True
+    torch.manual_seed(0)
+    module = TeaCacheTransformer().eval()
+    x = torch.randn(2, 4)
+    with torch.no_grad():
+        expected = module(x)
+        expected_modulated = module.modulated
+    saved = {k: getattr(shared.opts, k) for k in ('group_offload_type', 'group_offload_blocks', 'group_offload_stream', 'group_offload_pin', 'group_offload_record')}
+    orig_device = sd_offload_group.devices.device
+    sd_offload_group.devices.device = device
+    try:
+        shared.opts.data.update(group_offload_type='block_level', group_offload_blocks=1, group_offload_stream=stream, group_offload_pin=True, group_offload_record=False)
+        sd_offload_group.apply_group_offload_component(module, 'transformer', main=True)
+        with torch.no_grad():
+            outputs = [module(x.to(device)).cpu() for _ in range(2)]
+        modulated = module.modulated.cpu()
+        assert getattr(module, 'sdnext_first_block_bridge', None) is not None, 'block level groups must bridge the first block'
+    finally:
+        sd_offload_group.remove_group_offload_component(module)
+        sd_offload_group.devices.device = orig_device
+        shared.opts.data.update(saved)
+    assert getattr(module, 'sdnext_first_block_bridge', None) is None, 'removing the hooks must remove the bridge'
+    for output in outputs:
+        assert torch.allclose(output, expected, atol=1e-5), 'the offloaded forward must match the cpu forward'
+    assert torch.allclose(modulated, expected_modulated, atol=1e-5), 'the first block norm read outside the block must see the real weights'
+    return True
+
+
+def test_block_level_teacache_reads_the_first_block():
+    return block_level_teacache(stream=False)
+
+
+def test_block_level_teacache_reads_the_first_block_with_streams():
+    return block_level_teacache(stream=True)
 
 
 # ============================================================
@@ -827,9 +922,12 @@ def run_all():
         test_ondemand_apply_leaves_weights_on_cpu,
         test_resident_placement_clears_the_ondemand_stamp,
         test_ondemand_offload_hands_back_the_loaded_tensors,
+        test_hook_removal_hands_an_onloaded_module_back,
         test_group_offload_hands_back_the_loaded_tensors,
         test_no_split_units_are_the_outermost_declared_layers,
         test_group_offload_keeps_no_split_units_whole,
+        test_block_level_teacache_reads_the_first_block,
+        test_block_level_teacache_reads_the_first_block_with_streams,
     ]:
         run_test(cat, fn)
 

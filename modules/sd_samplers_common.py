@@ -11,7 +11,7 @@ from modules.image.util import collapse_alpha, draw_text
 
 
 SamplerData = namedtuple('SamplerData', ['name', 'constructor', 'aliases', 'options'])
-flow_models = ['f1', 'f2', 'f3', 'sd3', 'lumina', 'auraflow', 'sana', 'zimage', 'lumina2', 'cogview4', 'h1', 'cosmos', 'anima', 'chroma', 'omnigen', 'omnigen2', 'longcat', 'ideogram4', 'krea2', 'qwen21', 'mingimage', 'mossimage', 'fibo2']
+flow_models = ['f1', 'f2', 'f3', 'bluepixel', 'sd3', 'lumina', 'auraflow', 'sana', 'zimage', 'lumina2', 'cogview4', 'h1', 'cosmos', 'anima', 'chroma', 'omnigen', 'omnigen2', 'longcat', 'ideogram4', 'krea2', 'qwen21', 'mingimage', 'mossimage', 'fibo2']
 warned = False
 queue_lock = threading.Lock()
 debug = os.environ.get('SD_VAE_DEBUG', None) is not None
@@ -77,7 +77,11 @@ def single_sample_to_image(sample, approximation=None):
                 from modules.vae import sd_vae_taesd
                 x_sample = sd_vae_taesd.decode(sample)
             elif approximation == "Full":
-                x_sample = processing.decode_first_stage(shared.sd_model, sample.unsqueeze(0), output_type='pil', use_job=False)[0]
+                shared.state.preview_thread = threading.get_ident()
+                try:
+                    x_sample = processing.decode_first_stage(shared.sd_model, sample.unsqueeze(0), output_type='pil', use_job=False)[0]
+                finally:
+                    shared.state.preview_thread = None
             else:
                 warn_once(f"method={approximation} unknown")
                 x_sample = get_missing_img('unknown method')

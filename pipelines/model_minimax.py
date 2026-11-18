@@ -22,6 +22,9 @@ def load_minimax(checkpoint_info, diffusers_load_config = None, workflow: str | 
         if transformer is not None:
             loaded['transformer'] = transformer
         repo_id = 'OzzyGT/MiniMax_H3_sdnq_dynamic_4bit' # nunchaku repo does not contain non-transformer modules
+    from modules.modular_load import modular_cache_dir
+    from pipelines.minimax.minimax_vae import load_vae
+    loaded['vae'] = load_vae(repo_id, modular_cache_dir(True), offline_args=offline_args)
 
     sd_models.warn_group_offload(min_vram=20)
     repo_cls = diffusers.MiniMaxH3ModularPipeline
@@ -38,18 +41,46 @@ def load_minimax(checkpoint_info, diffusers_load_config = None, workflow: str | 
         return None
 
     pipe.sd_checkpoint_info = checkpoint_info
+    pipe.is_video = True
     pipe.sdnext_force_offload = True # very large model, so each stage ends with an on-demand offload sweep
     if hasattr(pipe, 'min_duration') and hasattr(pipe, 'fps'):
         pipe.sdnext_supported_min_frames = int(pipe.min_duration * pipe.fps) # fresh pipes report the true floor; still mode gates per instance
 
     video_load.loaded_model = None # image-path load invalidates the video tab's name cache
-    if hasattr(pipe, 'vae'):
-        import torch
-        pipe.vae = pipe.vae.to(torch.float16) # minimax loads vae in float32
     if hasattr(pipe, 'vae') and hasattr(pipe.vae, 'enable_tiling'):
         pipe.vae.enable_tiling()
 
     from pipelines.minimax.minimax_latents import unpack_latents
     pipe.custom_unpack_latents = unpack_latents # add a helper to unpack the video latents from the block state
     devices.torch_gc()
+    return pipe
+
+
+def load_minimax_image(checkpoint_info, diffusers_load_config = None):
+    from modules.modular_load import load_modular_pipe
+    repo_id = sd_models.path_to_repo(checkpoint_info)
+    sd_models.hf_auth_check(checkpoint_info)
+    if repo_id is None or repo_id.lower() == 'none':
+        return None
+
+    offline_args = {'local_files_only': True} if shared.opts.offline_mode else {}
+    log.debug(f'Load model: type=MiniMaxH3Image repo="{repo_id}" offload={shared.opts.diffusers_offload_mode} dtype={devices.dtype}')
+    sd_models.warn_group_offload(min_vram=20)
+    pipe = load_modular_pipe(
+        diffusers.MiniMaxH3ImageModularPipeline,
+        repo_id,
+        offline_args=offline_args,
+        base=True,
+        load_config=diffusers_load_config,
+    )
+    if pipe is None:
+        return None
+
+    pipe.sd_checkpoint_info = checkpoint_info
+    pipe.sdnext_force_offload = True # very large model, so each stage ends with an on-demand offload sweep
+    pipe.num_timesteps = len(pipe.config.sample_sigmas) - 1 # the sampling grid is fixed, one output head per step
+    pipe.max_condition_images = 16 # references keep their own resolution, the request sets the output size
+    from pipelines.minimax.minimax_latents import unpack_image_latents
+    pipe.custom_unpack_latents = unpack_image_latents # live previews need the packed rows back in latent shape
+    devices.torch_gc(force=True, reason='load')
     return pipe

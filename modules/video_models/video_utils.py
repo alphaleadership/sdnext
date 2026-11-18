@@ -1,36 +1,19 @@
 import os
-import sys
 import time
 import inspect
 import importlib.util
 from contextlib import contextmanager
-from dataclasses import dataclass
-from PIL import Image
-from installer import install
 from modules import shared, sd_models, timer, errors, devices
 from modules.logger import log
-from modules.video_models.video_codecs import codecs_config
+from modules.video_models.video_codecs import codecs_config, VIDEO_EXTENSIONS
 
 
 debug = log.trace if os.environ.get('SD_VIDEO_DEBUG', None) is not None else lambda *args, **kwargs: None
 MEDIA_EXTENSIONS = {
     'image': ('.png', '.jpg', '.jpeg', '.webp'),
-    'video': ('.mp4', '.mov', '.avi'),
+    'video': tuple(sorted(f'.{ext}' for ext in VIDEO_EXTENSIONS)),
     'audio': ('.wav', '.mp3', '.flac', '.aac'),
 }
-
-
-@dataclass
-class MediaProbe:
-    """What a container header reports, without decoding any of it."""
-    kind: str
-    fps: float | None = None
-    frames: int | None = None
-    duration: float | None = None # seconds
-    width: int | None = None
-    height: int | None = None
-    channels: int | None = None
-    sample_rate: int | None = None
 
 
 def queue_err(msg):
@@ -54,9 +37,11 @@ def supports_last_frame(model):
     return not getattr(getattr(model, 'config', None), 'expand_timesteps', False)
 
 
+HARDWARE_CAPABILITIES = 0x40000 | 0x80000 # AV_CODEC_CAP_HARDWARE, AV_CODEC_CAP_HYBRID
+
+
 def check_av():
     """The av module, or None when it is unavailable; callers guard on the None."""
-    install('av')
     try:
         import av
         av.logging.set_level(av.logging.ERROR) # pylint: disable=c-extension-no-member
@@ -64,6 +49,27 @@ def check_av():
         log.error(f'av package: {e}')
         return None
     return av
+
+
+def is_hardware_codec(codec) -> bool:
+    """Encoder backed by a device or driver: present in any av build, opens only with that hardware."""
+    return bool(codec.capabilities & HARDWARE_CAPABILITIES)
+
+
+def open_failure_reason(av, codec_name: str, pix_fmt: str, e: Exception) -> str:
+    """Why an encoder did not open, in terms the user can act on; libav's own last log line when nothing more specific applies."""
+    try:
+        codec = av.Codec(codec_name, mode='w')
+    except Exception:
+        return f'encoder {codec_name} is not in this av build'
+    formats = [f.name for f in (codec.video_formats or [])]
+    if formats and pix_fmt not in formats:
+        return f'pixel format {pix_fmt} not supported, {codec_name} accepts {", ".join(formats)}'
+    entry = getattr(e, 'log', None)
+    reason = entry[2].strip() if entry and len(entry) > 2 and entry[2] else str(e)
+    if is_hardware_codec(codec):
+        reason += '; hardware encoder, device or driver unavailable'
+    return reason
 
 
 def has_torchaudio():
@@ -113,38 +119,6 @@ def classify_extension(fn: str):
     return None
 
 
-def probe_media(fn: str, kind: str):
-    """Container metadata for a media file, None when it cannot be opened. Reads headers only, so
-    a file too large or too short to use is rejected before anything decodes it."""
-    av = check_av()
-    if not av:
-        return None
-    probe = MediaProbe(kind=kind)
-    try:
-        with av.open(fn) as container:
-            if kind == 'video' and container.streams.video: # an audio file with cover art carries a video stream that is not frames
-                stream = container.streams.video[0]
-                rate = stream.average_rate or stream.guessed_rate # average_rate is a Fraction and can be a falsy 0/1, which is why the decoder falls back the same way
-                probe.fps = float(rate) if rate else None
-                probe.frames = stream.frames or None # 0 means the container carries no count, not an empty file
-                probe.width, probe.height = stream.codec_context.width, stream.codec_context.height
-                if stream.duration is not None and stream.time_base is not None:
-                    probe.duration = float(stream.duration * stream.time_base) # stream durations are in time_base units
-                elif container.duration is not None:
-                    probe.duration = container.duration / 1000000 # container durations are in AV_TIME_BASE units
-                elif probe.frames and probe.fps:
-                    probe.duration = probe.frames / probe.fps
-            if container.streams.audio:
-                stream = container.streams.audio[0]
-                # the soundtrack decoder converts to planar float keeping the container's own rate and layout, so these are the values it yields
-                probe.channels = getattr(stream, 'channels', None) or getattr(getattr(stream, 'layout', None), 'nb_channels', None)
-                probe.sample_rate = int(stream.codec_context.sample_rate)
-    except Exception as e:
-        debug(f'Video probe: file="{fn}" {e}')
-        return None
-    return probe
-
-
 def hijack_encode_image(*args, **kwargs):
     t0 = time.time()
     try:
@@ -179,7 +153,7 @@ def get_codecs():
                     codecs.append(c)
         except Exception:
             pass
-    hw_codecs = [c for c in codecs if (c.capabilities & 0x40000 > 0) or (c.capabilities & 0x80000 > 0)]
+    hw_codecs = [c for c in codecs if is_hardware_codec(c)]
     sw_codecs = [c for c in codecs if c not in hw_codecs]
     log.debug(f'Video codecs enum: hardware={len(hw_codecs)} software={len(sw_codecs)} rejected={rejected}')
     """
@@ -189,45 +163,3 @@ def get_codecs():
         log.trace(f'codec={c.name} cname="{c.canonical_name}" decs="{c.long_name}" intra={c.intra_only} lossy={c.lossy} lossless={c.lossless} capabilities={c.capabilities} hw=False')
     """
     return ['none'] + [c.name for c in hw_codecs + sw_codecs]
-
-
-def decode_fourcc(cc):
-    cc_bytes = int(cc).to_bytes(4, byteorder=sys.byteorder) # convert code to a bytearray
-    cc_str = cc_bytes.decode() # decode byteaarray to a string
-    return cc_str
-
-
-def get_video_frames(fn: str, num_frames: int = -1, skip_frames: int = 0):
-    import cv2
-    frames = []
-    try:
-        video = cv2.VideoCapture(fn)
-        if not video.isOpened():
-            return frames
-        frame_count = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = int(video.get(cv2.CAP_PROP_FPS))
-        w, h = int(video.get(cv2.CAP_PROP_FRAME_WIDTH)), int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        codec = decode_fourcc(video.get(cv2.CAP_PROP_FOURCC))
-        skip = 0
-        while True:
-            status, frame = video.read()
-            if skip_frames > 0:
-                if skip < skip_frames:
-                    skip += 1
-                    _status, _frame = video.read()
-                    continue
-                skip = 0
-            if status:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame = Image.fromarray(frame)
-                frames.append(frame)
-            else:
-                break
-            if len(frames) >= num_frames > 0:
-                break
-        video.release()
-        log.debug(f'Video open: file="{fn}" frames={len(frames)} total={frame_count} skip={skip} fps={fps} size={w}x{h} codec={codec}')
-    except Exception as e:
-        log.error(f'Video open: file="{fn}" {e}')
-        return frames
-    return frames

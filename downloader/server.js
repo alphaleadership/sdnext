@@ -466,7 +466,7 @@ const EMAIL_TO         = process.env.dest;
 const WATCH_FOLDER     = ['E:\\sdnext\\outputs',"./tosend","./generated"];
 const POLL_INTERVAL_MS = 3000; // vérifie toutes les 3 secondes
 // Extensions à surveiller
-const EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp',".pdf"];
+const EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp', ".pdf", ".zip"];
 
 // Types MIME corrects pour l'envoi par email (le .pdf partait en image/png)
 const MIME_TYPES = {
@@ -475,6 +475,7 @@ const MIME_TYPES = {
   '.jpeg': 'image/jpeg',
   '.webp': 'image/webp',
   '.pdf': 'application/pdf',
+  '.zip': 'application/zip',
 };
 const SEND_EXISTING    = true;
 // ============================================================

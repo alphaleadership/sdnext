@@ -13,7 +13,7 @@ from modules.logger import log
 
 
 debug_install = log.debug if os.environ.get('SD_INSTALL_DEBUG', None) is not None else lambda *args, **kwargs: None
-commandline_args = os.environ.get('COMMANDLINE_ARGS', "--insecure")
+commandline_args = os.environ.get('COMMANDLINE_ARGS', "")
 sys.argv += shlex.split(commandline_args)
 args = None
 parser = None
@@ -78,12 +78,7 @@ def get_custom_args():
 
 
 @lru_cache
-def git_tag(): # compatibility function for extensions
-    try:
-        return run(f"{git} describe --tags --always").strip()
-    except Exception:
-        return "<none>"
-
+def commit_hash(): # compatibility function
     global stored_commit_hash # pylint: disable=global-statement
     if stored_commit_hash is not None:
         return stored_commit_hash
@@ -95,7 +90,6 @@ def git_tag(): # compatibility function for extensions
     return stored_commit_hash
 
 
-@lru_cache
 def run(command, desc=None, errdesc=None, custom_env=None, live=False): # compatibility function
     if desc is not None:
         log.info(desc)
@@ -253,11 +247,13 @@ def main():
     if args.skip_all:
         args.quick = True
     installer.check_python()
+    installer.check_git()
     if args.reset:
         installer.git_reset()
     if args.skip_git or args.skip_all:
         log.info('Skipping GIT operations')
     log.info(f'Platform: {installer.print_dict(installer.get_platform())}')
+    log.info(f'Toolkit: {installer.print_dict(installer.get_tools())}')
     installer.check_version()
     installer.check_venv()
     log.info(f'Args: {installer.mask_args(sys.argv[1:], args)}')

@@ -391,6 +391,8 @@ def load_diffuser_force(detected_model_type: str, checkpoint_info: CheckpointInf
     unload_model_weights(op=op)
     shared.sd_model = None
     model_type = detected_model_type.removesuffix('SDNQ').strip()
+    repo_id = path_to_repo(checkpoint_info)
+    modelloader.check_mirror(repo_id)
     try:
         # explicit load-by-type
         if model_type in ['Stable Cascade']:
@@ -444,6 +446,10 @@ def load_diffuser_force(detected_model_type: str, checkpoint_info: CheckpointInf
         elif model_type in ['FLUX2']:
             from pipelines.model_flux2 import load_flux2
             sd_model = load_flux2(checkpoint_info, diffusers_load_config)
+            allow_post_quant = False
+        elif model_type in ['BluePixel']:
+            from pipelines.model_bluepixel import load_bluepixel
+            sd_model = load_bluepixel(checkpoint_info, diffusers_load_config)
             allow_post_quant = False
         elif model_type in ['FLUX2Klein']:
             from pipelines.model_flux2_klein import load_flux2_klein
@@ -516,6 +522,10 @@ def load_diffuser_force(detected_model_type: str, checkpoint_info: CheckpointInf
         elif model_type in ['WanAI']:
             from pipelines.model_wanai import load_wan
             sd_model = load_wan(checkpoint_info, diffusers_load_config)
+            allow_post_quant = False
+        elif model_type in ['MiniMaxH3Image']:
+            from pipelines.model_minimax import load_minimax_image
+            sd_model = load_minimax_image(checkpoint_info, diffusers_load_config)
             allow_post_quant = False
         elif model_type in ['MiniMaxH3']:
             from pipelines.model_minimax import load_minimax
@@ -959,7 +969,7 @@ def load_diffuser(checkpoint_info: CheckpointInfo | None = None, op='model', rev
         diffusers_load_config['offload_folder'] = paths.temp_dir
     if revision is not None:
         diffusers_load_config['revision'] = revision
-    if shared.opts.diffusers_model_load_variant != 'default':
+    if shared.opts.diffusers_model_load_variant != 'default' and len(shared.opts.diffusers_model_load_variant) > 0:
         diffusers_load_config['variant'] = shared.opts.diffusers_model_load_variant
     if shared.opts.diffusers_pipeline == 'Custom Diffusers Pipeline' and len(shared.opts.custom_diffusers_pipeline) > 0:
         log.debug(f'Model pipeline: pipeline="{shared.opts.custom_diffusers_pipeline}"')
@@ -1151,6 +1161,7 @@ def load_diffuser(checkpoint_info: CheckpointInfo | None = None, op='model', rev
         from modules import modelstats
         modelstats.analyze()
 
+    log.info(f'Model capabilities: {shared.sd_model_capabilities}')
     log.info(f"Load {op}: type={shared.sd_model_type} time={timer.load.dct()} native={get_native(sd_model)} memory={memory_stats()}")
 
     from modules.platform import cleanup
@@ -1186,6 +1197,9 @@ def get_class_task(cls: type) -> DiffusersTaskType:
 
 
 def get_diffusers_task(pipe: diffusers.DiffusionPipeline) -> DiffusersTaskType:
+    task_type = getattr(pipe, 'sdnext_task_type', None)
+    if task_type is not None:
+        return task_type
     return get_class_task(pipe.__class__)
 
 
@@ -1225,6 +1239,13 @@ def get_max_condition_images(pipe: diffusers.DiffusionPipeline | None = None) ->
     if pipe is None:
         pipe = shared.sd_model
     return int(getattr(pipe, 'max_condition_images', 0) or 0)
+
+
+def get_condition_image_rule(pipe: diffusers.DiffusionPipeline | None = None) -> dict:
+    """Size the pipeline resamples each condition image to, as data; rule None when it declares none."""
+    if pipe is None:
+        pipe = shared.sd_model
+    return getattr(pipe, 'condition_image_rule', None) or {'rule': None}
 
 
 def takes_condition_set(pipe: diffusers.DiffusionPipeline | None = None) -> bool:
@@ -1375,6 +1396,7 @@ def copy_diffuser_options(new_pipe, orig_pipe):
     new_pipe.restore_pipeline = getattr(orig_pipe, 'restore_pipeline', None)
     new_pipe.max_condition_images = getattr(orig_pipe, 'max_condition_images', None)
     new_pipe.single_prompt = getattr(orig_pipe, 'single_prompt', None)
+    new_pipe.condition_image_rule = getattr(orig_pipe, 'condition_image_rule', None)
     new_pipe.patch_size = getattr(orig_pipe, 'patch_size', None)
     new_pipe.custom_unpack_latents = getattr(orig_pipe, 'custom_unpack_latents', None)
     # a1111 compatibility item
@@ -1409,6 +1431,7 @@ def backup_pipe_components(pipe):
         'patch_size': getattr(pipe, "patch_size", None),
         'max_condition_images': getattr(pipe, "max_condition_images", None),
         'single_prompt': getattr(pipe, "single_prompt", None),
+        'condition_image_rule': getattr(pipe, "condition_image_rule", None),
         'hijack_prompt': hasattr(pipe, "orig_encode_prompt"),
         'hijack_vae': hasattr(pipe, "vae") and hasattr(pipe.vae, "orig_decode")
     }
@@ -1442,6 +1465,8 @@ def restore_pipe_components(pipe, components):
         pipe.max_condition_images = components['max_condition_images']
     if components['single_prompt'] is not None:
         pipe.single_prompt = components['single_prompt']
+    if components['condition_image_rule'] is not None:
+        pipe.condition_image_rule = components['condition_image_rule']
     if components['hijack_prompt']:
         sd_hijack_te.init_hijack(pipe)
     if components['hijack_vae']:
@@ -1463,6 +1488,8 @@ def set_diffuser_pipe(pipe, new_pipe_type):
     if get_diffusers_task(pipe) == new_pipe_type:
         return pipe
     if pipe_serves_task(pipe, new_pipe_type): # a class registered for several tasks classifies as one of them
+        if hasattr(pipe, 'sdnext_task_type'):
+            pipe.sdnext_task_type = new_pipe_type
         return pipe
 
     if get_diffusers_task(pipe) == DiffusersTaskType.MODULAR:
@@ -1724,6 +1751,8 @@ def unload_model_weights(op='model'):
         from sdnq.common import reset_compile_caches
         reset_compile_caches() # dead compiled-dequant graphs and their lifetime recompile counters otherwise accumulate across switches
         devices.torch_gc(force=True, reason='unload')
+        from modules.platform import trim
+        trim()
         log.debug(f'Unload {op}: {memory_stats()} fn={fn}')
     elif (op == 'refiner') and model_data.sd_refiner:
         log.debug(f'Current {op}: {memory_stats()}')
@@ -1731,6 +1760,8 @@ def unload_model_weights(op='model'):
         move_model(model_data.sd_refiner, 'meta')
         model_data.sd_refiner = None
         devices.torch_gc(force=True, reason='unload')
+        from modules.platform import trim
+        trim()
         log.debug(f'Unload {op}: {memory_stats()}  fn={fn}')
 
 
@@ -1755,7 +1786,7 @@ def hf_auth_check(checkpoint_info: CheckpointInfo | str, force:bool=False):
     auth_ok = False
     try:
         login = modelloader.hf_login()
-        token = os.environ.get('HF_TOKEN', None)
+        token = sd_hijack_hfhub.resolve_token()
         hf.auth_check(repo_id, write=False, token=token)
         auth_ok = True
     except Exception as e:
@@ -1783,7 +1814,6 @@ def save_model(name: str, path: str | None = None, shard: str = "5GB", overwrite
         torch.cuda.synchronize()
     except Exception:
         pass
-    jobid = shared.state.begin('Save model')
     try:
         t0 = time.time()
         log.info(f'Save model: path="{model_name}" cls={shared.sd_model.__class__.__name__} start')
@@ -1806,7 +1836,6 @@ def save_model(name: str, path: str | None = None, shard: str = "5GB", overwrite
     finally:
         if 'save_pretrained' in vars(shared.sd_model):
             del shared.sd_model.save_pretrained # drop the instance shadow, restoring the class method
-        shared.state.end(jobid)
 
 
 def list_hfcache():

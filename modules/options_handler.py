@@ -6,6 +6,7 @@ import threading
 from typing import TYPE_CHECKING
 from modules import cmd_args, errors
 from modules.json_helpers import readfile, writefile
+from modules.paths import create_path
 from modules.shared_legacy import LegacyOption
 from modules.logger import log
 
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
     import builtins
 
 cmd_opts = cmd_args.parse_args()
-compatibility_opts = ['clip_skip', 'uni_pc_lower_order_final', 'uni_pc_order', 'xformers_options', 'lora_apply_te']
+compatibility_opts = ['clip_skip', 'uni_pc_lower_order_final', 'uni_pc_order', 'xformers_options', 'lora_apply_te', 'taesd_layers']
 removed_values = { # a stored choice that no longer exists is kept by validate, so it has to be rewritten or it selects nothing
     'cross_attention_optimization': (['Batch matrix-matrix', 'Dynamic Attention BMM'], 'Scaled-Dot-Product'),
 }
@@ -54,6 +55,7 @@ class Options:
         self.secretsfn: str = secrets or cmd_opts.secrets
         self.restricted: set[str] = restricted
         self.legacy = [k for k, v in options_templates.items() if isinstance(v, LegacyOption)]
+        self.pending_keys: list[str] = [] # stored keys without an option at load, checked again by validate_pending
         self.load()
 
     def __getattr__(self, item):
@@ -186,6 +188,8 @@ class Options:
                     secrets[k] = v
                 else:
                     options[k] = v
+            create_path(os.path.dirname(filename)) # the first save runs before create_paths makes a new data dir
+            create_path(os.path.dirname(secretsfn))
             writefile(options, filename, silent=silent)
             writefile(secrets, secretsfn, silent=silent)
             if self.debug:
@@ -219,8 +223,13 @@ class Options:
         migrated = migrate_removed_values(self.data)
         if len(migrated) > 0:
             log.warning(f"Setting migration: {migrated}")
+        self.pending_keys = self.validate_keys(list(self.data))
+
+    def validate_keys(self, keys: builtins.list[str]) -> builtins.list[str]:
+        """reset stored values that do not fit their option, returning the keys no option claims"""
         unknown_settings = []
-        for k, v in self.data.items():
+        for k in keys:
+            v = self.data[k]
             info = self.data_labels.get(k, None)
             if info is not None:
                 if not info.validate(k, v):
@@ -230,6 +239,12 @@ class Options:
                 self.data[k] = info.default
             if info is None and k not in compatibility_opts and not k.startswith('uiux_'):
                 unknown_settings.append(k)
+        return unknown_settings
+
+    def validate_pending(self):
+        """validate stored keys whose options were added after load, once extensions have added theirs"""
+        unknown_settings = self.validate_keys([k for k in self.pending_keys if k in self.data])
+        self.pending_keys = []
         if len(unknown_settings) > 0:
             log.warning(f"Setting validation: unknown={unknown_settings}")
 

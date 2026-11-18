@@ -471,6 +471,8 @@ def create_settings(cmd_opts):
     # --- Server Settings ---
     options_templates.update(options_section(('server', "Server Settings"), {
         "server_listen": OptionInfo(False, "Listen on all interfaces", gr.Checkbox),
+        "chat_enabled": OptionInfo(True, "Enable Chat feature", gr.Checkbox),
+        "scheduler_state": OptionInfo("Paused", "Scheduler state", gr.Dropdown, {"choices": ["Active", "Paused", "Auto", "Stopped"]}),
         "server_status": OptionInfo(120, "Automatic server status monitor rate", gr.Number, {"minimum": 0, "maximum": 1000, "step": 1}),
         "server_monitor": OptionInfo(0, "Automatic server memory monitor rate", gr.Number, {"minimum": 0, "maximum": 1000, "step": 1}),
         "server_rate_limit": OptionInfo(300, "API base rate limit rate", gr.Number, {"minimum": 0, "maximum": 1000, "step": 1}),
@@ -490,12 +492,14 @@ def create_settings(cmd_opts):
         "unet_dir": OptionInfo(os.path.join(paths.models_path, 'UNET'), "Folder with UNET files", folder=True),
         "te_dir": OptionInfo(os.path.join(paths.models_path, 'Text-encoder'), "Folder with Text encoder files", folder=True),
         "lora_dir": OptionInfo(os.path.join(paths.models_path, 'Lora'), "Folder with LoRA network(s)", folder=True),
-        "styles_dir": OptionInfo(os.path.join(paths.models_path, 'styles'), "File or Folder with user-defined styles", folder=True),
+        "styles_dir": OptionInfo(os.path.join(paths.models_path, 'styles'), "Folder with user-defined styles", folder=True),
         "wildcards_dir": OptionInfo(os.path.join(paths.models_path, 'wildcards'), "Folder with user-defined wildcards", folder=True),
         "autocomplete_dir": OptionInfo(os.path.join(paths.models_path, 'autocomplete'), "Folder with tag autocomplete files", folder=True),
         "embeddings_dir": OptionInfo(os.path.join(paths.models_path, 'embeddings'), "Folder with textual inversion embeddings", folder=True),
         "control_dir": OptionInfo(os.path.join(paths.models_path, 'control'), "Folder with Control models", folder=True),
         "yolo_dir": OptionInfo(os.path.join(paths.models_path, 'yolo'), "Folder with Yolo models", folder=True),
+        "chat_dir": OptionInfo(os.path.join(paths.models_path, 'chat'), "Folder for chat database", folder=True),
+        "chat_upload_dir": OptionInfo("", "Folder for chat artifacts; leave empty for default", folder=True),
         "scheduler_dir": OptionInfo(os.path.join(paths.models_path, 'scheduler'), "Folder for scheduler database", folder=True),
         "esrgan_models_path": OptionInfo(os.path.join(paths.models_path, 'ESRGAN'), "Folder with ESRGAN models", folder=True),
         "bsrgan_models_path": OptionInfo(os.path.join(paths.models_path, 'BSRGAN'), "Folder with BSRGAN models", folder=True),
@@ -520,7 +524,7 @@ def create_settings(cmd_opts):
     options_templates.update(options_section(('saving-images', "Media Options"), {
         "samples_save": OptionInfo(True, "Save all generated media"),
         "keep_incomplete": OptionInfo(True, "Save interrupted media"),
-        "samples_format": OptionInfo('jpg', 'Image file format', gr.Dropdown, {"choices": ["jpg", "png", "webp", "tiff", "jp2", "jxl", "heif"]}),
+        "samples_format": OptionInfo('jpg', 'Image file format', gr.Dropdown, {"choices": ["jpg", "png", "webp", "tiff", "jp2", "jxl", "heif", "avif", "exr"]}),
         "jpeg_quality": OptionInfo(90, "Image quality", gr.Slider, {"minimum": 1, "maximum": 100, "step": 1}),
         "img_max_size_mp": OptionInfo(1000, "Image maximum size (MP)", gr.Slider, {"minimum": 10, "maximum": 2000, "step": 1}),
         "ui_video_convert": OptionInfo(False, "Videos convert for UI playback"),
@@ -532,7 +536,7 @@ def create_settings(cmd_opts):
 
         "image_sep_grid": OptionInfo("<h2>Grid Options</h2>", "", gr.HTML),
         "grid_save": OptionInfo(True, "Save all generated image grids"),
-        "grid_format": OptionInfo('jpg', 'File format', gr.Dropdown, {"choices": ["jpg", "png", "webp", "tiff", "jp2", "jxl"]}),
+        "grid_format": OptionInfo('jpg', 'Grid file format', gr.Dropdown, {"choices": ["jpg", "png", "webp", "tiff", "jp2", "jxl"]}),
         "n_rows": OptionInfo(-1, "Grid max rows count", gr.Slider, {"minimum": -1, "maximum": 16, "step": 1}),
         "n_cols": OptionInfo(-1, "Grid max columns count", gr.Slider, {"minimum": -1, "maximum": 16, "step": 1}),
         "grid_background": OptionInfo("#000000", "Grid background color", gr.ColorPicker, {}),
@@ -659,13 +663,6 @@ def create_settings(cmd_opts):
         "send_size": OptionInfo(False, "Send size when sending prompt or image to another interface", gr.Checkbox, {"visible": False}),
     }))
 
-    # --- Scheduler ---
-    options_templates.update(options_section(('scheduler', "Scheduler"), {
-        "scheduler_state": OptionInfo("Paused", "Scheduler state", gr.Dropdown, {"choices": ["Active", "Paused", "Auto", "Stopped"], "visible": False}),
-        "scheduler_start": OptionInfo("09:00", "Scheduler start time", gr.Textbox, {"visible": False}),
-        "scheduler_end": OptionInfo("18:00", "Scheduler end time", gr.Textbox, {"visible": False}),
-    }))
-
     # --- Live Previews ---
     options_templates.update(options_section(('live-preview', "Live Previews"), {
         "show_progress_every_n_steps": OptionInfo(1, "Live preview display period", gr.Slider, {"minimum": 0, "maximum": 20, "step": 1, "visible": False}),
@@ -674,7 +671,6 @@ def create_settings(cmd_opts):
         "live_preview_force": OptionInfo(False, "Force live previews on each step"),
         "live_preview_require_focus": OptionInfo(True, "Pause live previews when tab is not focused"),
         "live_preview_downscale": OptionInfo(True, "Downscale high resolution live previews"),
-        "taesd_layers": OptionInfo(3, "Tiny: decode layers", gr.Slider, {"minimum": 1, "maximum": 3, "step": 1}),
         "taesd_frames": OptionInfo(4, "Tiny: video frames", gr.Slider, {"minimum": -1, "maximum": 32, "step": 1, "visible": False}),
 
         "notification_audio_enable": OptionInfo(False, "Play a notification upon completion"),
@@ -714,7 +710,7 @@ def create_settings(cmd_opts):
         "diffuser_cache_config": OptionInfo(True, "Use cached model config when available"),
         "huggingface_token": OptionInfo('', 'HuggingFace token', gr.Textbox, {"lines": 2}, secret=True, env_var='HF_TOKEN'),
         "hf_transfer_mode": OptionInfo("XET", "HuggingFace download method", gr.Dropdown, {"choices": ['HTTP', 'XET', 'XET HighPerformance', 'XET Sequential']}),
-        "huggingface_mirror": OptionInfo('', 'HuggingFace mirror', gr.Textbox),
+        "huggingface_mirror": OptionInfo('None', 'HuggingFace mirror', gr.Dropdown, {"choices": ['None', 'HF-Mirror']}),
         "offline_mode": OptionInfo(False, 'Force offline mode', gr.Checkbox),
 
         "diffusers_model_load_variant": OptionInfo("default", "Preferred Model variant", gr.Radio, {"choices": ['default', 'fp32', 'fp16']}),
@@ -810,6 +806,12 @@ def create_settings(cmd_opts):
                 "autocomplete_min_chars": OptionInfo(3, "Min autocomplete chars", gr.Slider, {"minimum": 2, "maximum": 6, "step": 1, "visible": False}),
                 "autocomplete_keep_underscores": OptionInfo(False, "Keep underscores in autocomplete", gr.Checkbox, {"visible": False}),
                 "autocomplete_append_comma": OptionInfo(True, "Append comma after autocomplete", gr.Checkbox, {"visible": False}),
+                "autocomplete_at_prefix_artist": OptionInfo(False, "Keep @ on artist insert", gr.Checkbox, {"visible": False}),
+                "autocomplete_translations": OptionInfo(False, "Foreign-term translations in autocomplete", gr.Checkbox, {"visible": False}),
+
+                # Scheduler settings (controlled via Scheduler Tab UI)
+                "scheduler_start": OptionInfo("09:00", "Scheduler start time", gr.Textbox, {"visible": False}),
+                "scheduler_end": OptionInfo("18:00", "Scheduler end time", gr.Textbox, {"visible": False}),
 
                 # Caption settings (controlled via Caption Tab UI)
                 "caption_default_type": OptionInfo("VLM", "Default caption type", gr.Radio, {"choices": ["VLM", "OpenCLiP", "Tagger"], "visible": False}),

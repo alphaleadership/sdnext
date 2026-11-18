@@ -102,6 +102,11 @@ def missing_components(pipe, workflow: str | None) -> list:
     return [name for name in names if getattr(pipe, name, None) is None]
 
 
+def modular_cache_dir(base: bool) -> str:
+    """Cache folder of a modular repo: base models live in the diffusers folder so the model scan lists them; video-only models stay out of the dropdown."""
+    return shared.opts.diffusers_dir if base else shared.opts.hfcache_dir
+
+
 def load_modular_pipe(repo_cls,
                       repo: str,
                       workflow: str | None = None,
@@ -118,7 +123,7 @@ def load_modular_pipe(repo_cls,
         log.error(f'Load modular: repo="{repo}" cls="{repo_cls}" pipeline class not found: diffusers too old')
         return None
     offline_args = offline_args or {}
-    cache_dir = shared.opts.diffusers_dir if base else shared.opts.hfcache_dir # base models live in the diffusers folder so the model scan lists them; video-only models stay out of the dropdown
+    cache_dir = modular_cache_dir(base)
     try:
         t0 = time.time()
         log.debug(f'Load modular: repo="{repo}" cls={repo_cls.__name__} blocks={blocks.__class__.__name__ if blocks is not None else None} workflow={workflow} base={base}')
@@ -154,13 +159,13 @@ def load_modular_pipe(repo_cls,
         loaded = [name for name, component in pipe.components.items() if component is not None]
         empty = [name for name, component in pipe.components.items() if component is None]
         missing = missing_components(pipe, workflow)
-        pipe.sdnext_missing_components = missing # a caller that can recover a component clears its own entry
         pipe.sdnext_video_workflow = workflow # the workflow this pipe was loaded for, which is what the reference-workflow guard reads; the executed task is chosen per request
         log.info(f'Load modular: cls={pipe.__class__.__name__} workflow={workflow} components={loaded} empty={empty} time={time.time()-t0:.2f}')
         if missing:
             # load_components builds each component in its own try/except and reports a failure as a warning on the
             # diffusers logger, so the reason is in the log above this line rather than in the exception path
             log.error(f'Load modular: cls={pipe.__class__.__name__} workflow={workflow} missing={missing} components the workflow requires did not load')
+            return None
 
         sd_hijack_modular.install_state_hook(pipe)
         sd_hijack_modular.register_callbacks(pipe)

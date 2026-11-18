@@ -991,6 +991,14 @@
     "size": 134.12,
     "date": "2026 August"
   },
+  "MiniMaxAI MiniMax-H3-Image": {
+    "path": "MiniMaxAI/MiniMax-H3-Image",
+    "preview": "MiniMaxAI--MiniMax-H3-Image.jpg",
+    "desc": "MiniMax-H3-Image generates and edits images with the 33B single-stream MiniMax-H3 transformer without its audio layers and the same Qwen3-VL conditioner. Images of 4 to 20 megapixels are generated in 6 distilled steps without guidance, and up to 16 reference images are addressed in the prompt as <Picture 1>, <Picture 2> and so on.",
+    "extras": "sampler: Default, steps: 6",
+    "size": 135.35,
+    "date": "2026 November"
+  },
   "inclusionAI LLaDA-Image": {
     "path": "inclusionAI/LLaDA-Image",
     "preview": "inclusionAI--LLaDA-Image.jpg",
@@ -1062,5 +1070,13 @@
     "extras": "sampler: Default, cfg_scale: 3.0, steps: 50",
     "size": 27.22,
     "date": "2026 October"
+  },
+  "vivo BluePixel Turbo": {
+    "path": "openvivo/BluePixel-Turbo",
+    "preview": "openvivo--BluePixel-Turbo.jpg",
+    "desc": "BluePixel-Turbo is vivo's four-step distilled instruction-based image-editing model built on FLUX.2 Klein 9B with a DCAE-F64 autoencoder for native 4K editing. Weights are subject to the FLUX Non-Commercial License.",
+    "extras": "sampler: FlowMatch Euler, cfg_scale: 3.0, steps: 4",
+    "size": 36.31,
+    "date": "2026 November"
   }
 }

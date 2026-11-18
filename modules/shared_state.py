@@ -22,6 +22,7 @@ class State:
     results = []
     skipped = False
     interrupted = False
+    error = ''
     paused = False
     job = ""
     job_no = 0
@@ -40,6 +41,7 @@ class State:
     current_sigma_next = None
     current_image = None
     current_image_sampling_step = -1
+    preview_thread = None # thread running a full vae preview decode, which is not a pipeline stage
     id_live_preview = 0
     textinfo = None
     prediction_type = "epsilon"
@@ -59,6 +61,7 @@ class State:
         status = ' '
         status += 'skipped ' if self.skipped else ''
         status += 'interrupted ' if self.interrupted else ''
+        status += 'failed ' if self.error else ''
         status += 'paused ' if self.paused else ''
         status += 'restart ' if self.need_restart else ''
         status += 'oom ' if self.oom else ''
@@ -82,6 +85,11 @@ class State:
 
     def interrupt(self):
         log.debug('State: interrupt requested')
+        self.interrupted = True
+
+    def fail(self, e: Exception | str):
+        """Stop the job on an error; error tells a failed pass from a user interrupt."""
+        self.error = str(e) or type(e).__name__
         self.interrupted = True
 
     def pause(self):
@@ -136,6 +144,8 @@ class State:
         res.eta = round(predicted - res.elapsed, 2) if predicted is not None else None
         if self.paused:
             res.status = 'paused'
+        elif self.error:
+            res.status = 'failed'
         elif self.interrupted:
             res.status = 'interrupted'
         elif self.skipped:
@@ -150,15 +160,15 @@ class State:
                 return job
         return None
 
-    def history(self, op: str, task_id: str | None = None, results: list | None = None):
+    def history(self, op: str, task_id: str | None = None, results: list | None = None, title: str | None = None, timestamp: float | None = None, duration: float | None = None):
         if results is None:
             results = []
         job = {
             'id': task_id or self.id,
-            'job': self.job.lower(),
+            'job': (self.job if title is None else title).lower(),
             'op': op.lower(),
-            'timestamp': self.time_start,
-            'duration': self.duration,
+            'timestamp': self.time_start if timestamp is None else timestamp,
+            'duration': self.duration if duration is None else duration,
             'outputs': results,
          }
         self.state_history.append(job)
@@ -167,6 +177,10 @@ class State:
             del self.state_history[0]
         if debug_history:
             log.trace(f'State history: jobs={l} {job}')
+
+    def record(self, title: str) -> 'Record':
+        """Side job such as a save: history entries under its own id, the running job is left as it is."""
+        return Record(self, title)
 
     def outputs(self, results):
         if isinstance(results, list):
@@ -199,7 +213,8 @@ class State:
     def begin(self, title="", task_id=0, api=None) -> str:
         import modules.devices
         self.clear()
-        self.interrupted = self.interrupted if title.startswith('Save') else False
+        self.interrupted = False
+        self.error = ''
         self.skipped = False
         self.job_history += 1
         self.total_jobs += 1
@@ -283,18 +298,18 @@ class State:
             self.assign_current_image(last_image)
             return True
 
-        if self.current_latent is not None:
+        sample, noise_pred = self.current_latent, self.current_noise_pred # read once, the step callback replaces both from another thread
+        if sample is not None:
             try:
                 self.preview_job = self.job_no
-                sample = self.current_latent
                 self.current_image_sampling_step = self.sampling_step
                 try: # sigma correction
-                    if (self.current_noise_pred is not None) and (self.current_sigma is not None) and (self.current_sigma_next is not None) and (self.current_noise_pred.shape == sample.shape):
-                        original_sample = sample - (self.current_noise_pred * (self.current_sigma_next-self.current_sigma))
+                    if (noise_pred is not None) and (self.current_sigma is not None) and (self.current_sigma_next is not None) and (noise_pred.shape == sample.shape):
+                        original_sample = sample - (noise_pred * (self.current_sigma_next-self.current_sigma))
                         if self.prediction_type in {"epsilon", "flow_prediction"}:
-                            sample = original_sample - (self.current_noise_pred * self.current_sigma)
+                            sample = original_sample - (noise_pred * self.current_sigma)
                         elif self.prediction_type == "v_prediction":
-                            sample = self.current_noise_pred * (-self.current_sigma / (self.current_sigma**2 + 1) ** 0.5) + (original_sample / (self.current_sigma**2 + 1)) # pylint: disable=invalid-unary-operand-type
+                            sample = noise_pred * (-self.current_sigma / (self.current_sigma**2 + 1) ** 0.5) + (original_sample / (self.current_sigma**2 + 1)) # pylint: disable=invalid-unary-operand-type
                 except Exception:
                     pass # ignore sigma errors
                 image = sd_samplers_common.samples_decode(sample)
@@ -317,3 +332,21 @@ class State:
         self.current_image = image
         self.id_live_preview += 1
         self.preview_job = -1
+
+
+class Record:
+    """History entries of a side job; call end() once, with the written files in outputs."""
+
+    def __init__(self, state: State, title: str):
+        self.state = state
+        self.title = title
+        self.id = state.get_id()
+        self.timestamp = time.time()
+        self.outputs: list[str] = []
+        state.history('begin', self.id, title=title, timestamp=self.timestamp)
+
+    def end(self):
+        if len(self.outputs) > 0:
+            self.state.history('output', self.id, results=self.outputs, title=self.title, timestamp=self.timestamp)
+        now = time.time()
+        self.state.history('end', self.id, title=self.title, timestamp=now, duration=round(now - self.timestamp, 3))

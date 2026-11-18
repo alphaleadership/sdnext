@@ -315,7 +315,7 @@ class StableDiffusionProcessing:
 
         # initializers
         self.prompt = prompt
-        self.seed = int(seed)
+        self.seed = int(seed) if seed is not None else -1
         self.batch_size = batch_size
         self.n_iter = n_iter
         self.steps = steps
@@ -660,6 +660,8 @@ class StableDiffusionProcessingVideo(StableDiffusionProcessing):
         self.vae_tile_frames: int = kwargs.pop('vae_tile_frames', 0)
         self.video_engine: str = kwargs.pop('video_engine', None)
         self.video_model: str = kwargs.pop('video_model', None)
+        self.video_output_fps: float | None = kwargs.pop('video_output_fps', None)
+        self.video_framegen_factor: int | None = None
         self.video_interpolate: int = kwargs.pop('video_interpolate', 0)
         self.video_interpolate_scale: float = kwargs.pop('video_interpolate_scale', 1.0)
         self.video_interpolated: bool = False

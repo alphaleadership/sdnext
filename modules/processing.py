@@ -20,7 +20,6 @@ from modules.processing_class import ( # pylint: disable=unused-import
 opt_C = 4
 opt_f = 8
 debug = log.trace if os.environ.get('SD_PROCESS_DEBUG', None) is not None else lambda *args, **kwargs: None
-debug('Trace: PROCESS')
 create_binary_mask = processing_helpers.create_binary_mask
 apply_overlay = processing_helpers.apply_overlay
 apply_color_correction = processing_helpers.apply_color_correction
@@ -233,6 +232,8 @@ def process_images(p: StableDiffusionProcessing) -> Processed | None:
 
     finally:
         attention_context.end()
+        if shared.sd_loaded:
+            sd_models.offload_ondemand(shared.sd_model, reason='end') # a pass that raised or was interrupted inside an entry point skipped the seam that returns its component
         script_callbacks.after_process_callback(p)
 
         if p.override_settings_restore_afterwards: # restore opts to original state
@@ -423,7 +424,9 @@ def process_samples(p: StableDiffusionProcessing, samples, skip_postprocess_imag
 
         info = create_infotext(p, p.prompts, p.seeds, index=i)
         if get_opt(p, 'samples_save') and not p.do_not_save_samples and p.outpath_samples is not None:
-            images.save_image(image, p.outpath_samples, "", p.seeds[i], p.prompts[i], get_opt(p, 'samples_format'), info=info, p=p) # main save image
+            saved_path, _, _ = images.save_image(image, p.outpath_samples, "", p.seeds[i], p.prompts[i], get_opt(p, 'samples_format'), info=info, p=p) # main save image
+            if saved_path:
+                image.already_saved_as = saved_path
 
         image.info["parameters"] = info
         out_infotexts.append(info)
@@ -525,6 +528,9 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 samples = process_diffusers(p)
             timer.process.record('process')
 
+            if shared.state.error: # the live preview is a user interrupt's partial result, not a failed pass's
+                log.debug(f'Process: batch={n+1}/{p.n_iter} failed')
+                break
             if shared.state.interrupted:
                 log.debug(f'Process: batch={n+1}/{p.n_iter} interrupted')
                 _keep = get_opt(p, 'keep_incomplete')
@@ -585,16 +591,17 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
         _grid_save = get_opt(p, 'grid_save')
         if (_return_grid or _grid_save) and (not p.do_not_save_grid) and (len(output_images) > 1):
             if images.check_grid_size(output_images):
-                r, c = images.get_grid_size(output_images, p.batch_size)
-                grid = images.image_grid(output_images, p.batch_size)
-                grid_text = f'{r}x{c}'
-                grid_info = create_infotext(p, p.all_prompts, p.all_seeds, index=0, grid=grid_text)
-                if _return_grid:
-                    infotexts.insert(0, grid_info)
-                    output_images.insert(0, grid)
-                    index_of_first_image = 1
-                if _grid_save:
-                    images.save_image(grid, p.outpath_grids, "", p.all_seeds[0], p.all_prompts[0], get_opt(p, 'grid_format'), info=grid_info, p=p, grid=True) # main save grid
+                r, c = images.get_grid_size(output_images)
+                if r > 0 and c > 0:
+                    grid = images.image_grid(output_images)
+                    grid_text = f'{r}x{c}'
+                    grid_info = create_infotext(p, p.all_prompts, p.all_seeds, index=0, grid=grid_text)
+                    if _return_grid:
+                        infotexts.insert(0, grid_info)
+                        output_images.insert(0, grid)
+                        index_of_first_image = 1
+                    if _grid_save:
+                        images.save_image(grid, p.outpath_grids, "", p.all_seeds[0], p.all_prompts[0], get_opt(p, 'grid_format'), info=grid_info, p=p, grid=True) # main save grid
 
     results = get_processed(
         p,

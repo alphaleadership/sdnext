@@ -3,7 +3,6 @@ import sys
 import glob
 import ctypes
 import shutil
-import subprocess
 from types import ModuleType
 from typing import overload, TYPE_CHECKING
 from enum import Enum
@@ -12,6 +11,7 @@ if TYPE_CHECKING:
     import torch
 
 
+from installer import run
 from modules.logger import log
 
 
@@ -28,11 +28,6 @@ def dirname(path_: str, r: int = 1) -> str:
     for _ in range(0, r):
         path_ = os.path.dirname(path_)
     return path_
-
-
-def spawn(command: str | list[str], cwd: os.PathLike = '.', env: dict[str, str] | None = None) -> str:
-    process = subprocess.run(command, cwd=cwd, shell=True, check=False, capture_output=True, text=True, env=env)
-    return process.stdout
 
 
 def load_library_global(path_: str):
@@ -115,11 +110,11 @@ class Agent:
         self.gfx_version = Agent.parse_gfx_version(self.name)
         if self.gfx_version > 0x1000:
             self.arch = MicroArchitecture.RDNA
-        elif self.gfx_version in (0x908, 0x90a, 0x942,):
+        elif self.gfx_version in (0x908, 0x90a, 0x940, 0x941, 0x942, 0x950):
             self.arch = MicroArchitecture.CDNA
         else:
             self.arch = MicroArchitecture.GCN
-        self.is_apu = (self.gfx_version & 0xFFF0 == 0x1150) or self.gfx_version in (0x801, 0x902, 0x90c, 0x1013, 0x1033, 0x1035, 0x1036, 0x1103,)
+        self.is_apu = (self.gfx_version & 0xFFF0 == 0x1150) or self.gfx_version in (0x801, 0x902, 0x90c, 0x1013, 0x1033, 0x1035, 0x1036, 0x1103)
         blaslt_filename = f"TensileLibrary_lazy_{self.name}.dat"
 
         def has_tensile_library(path: str | None) -> bool:
@@ -154,7 +149,11 @@ class Agent:
     def get_gfx_version(self) -> str | None:
         if self.gfx_version is None:
             return None
-        if self.gfx_version >= 0x1100 and self.gfx_version < 0x1200:
+        elif self.gfx_version >= 0x1201 and self.gfx_version < 0x1250:
+            return "12.5.0"
+        elif self.gfx_version >= 0x1200 and self.gfx_version < 0x1201:
+            return "12.0.1"
+        elif self.gfx_version >= 0x1100 and self.gfx_version < 0x1200:
             return "11.0.0"
         elif self.gfx_version == 0x1010:
             return "10.1.0"
@@ -170,6 +169,7 @@ def configure_xnack(agents: list[Agent]):
     if unsupported:
         os.environ.pop('HSA_XNACK', None)
         log.info(f'ROCm: XNACK is Null for unsupported {unsupported}')
+
 
 def find() -> ROCmEnvironment | None:
     hip_path = shutil.which("hipconfig")
@@ -194,7 +194,7 @@ def find() -> ROCmEnvironment | None:
                 self.major, self.minor = [int(v) for v in string.strip().split(".")]
 
             def __gt__(self, other):
-                return self.major * 10 + other.minor > other.major * 10 + other.minor
+                return (self.major, self.minor) > (other.major, other.minor)
 
             def __str__(self):
                 return f"{self.major}.{self.minor}"
@@ -232,7 +232,8 @@ def get_version() -> str | None:
                 # hipconfig requires Perl
                 return os.path.basename(environment.path) or os.path.basename(os.path.dirname(environment.path))
             else:
-                arr = spawn("hipconfig --version", cwd=os.path.join(environment.path, 'bin')).split(".")
+                result, _ = run(["hipconfig", "--version"], cwd=os.path.join(environment.path, 'bin'))
+                arr = result.stdout.split(".")
                 return f'{arr[0]}.{arr[1]}' if len(arr) >= 2 else None
         elif isinstance(environment, PythonPackageEnvironment):
             # If rocm-sdk package is installed, the hip library may be used by PyTorch.
@@ -248,9 +249,10 @@ def get_version() -> str | None:
         log.error(f'ROCm: failed to get version: {e}')
         return None
 
+
 def get_flash_attention_command(agent: Agent) -> str:
     default = "git+https://github.com/ROCm/flash-attention"
-    if agent.gfx_version >= 0x1100 and agent.gfx_version < 0x1200 and os.environ.get("FLASH_ATTENTION_USE_TRITON_ROCM", "false").lower() != "true":
+    if agent.gfx_version >= 0x1100 and agent.gfx_version < 0x1250 and os.environ.get("FLASH_ATTENTION_USE_TRITON_ROCM", "false").lower() != "true":
         # use the navi_rotary_fix fork because the original doesn't support rotary_emb for transformers
         # original: "git+https://github.com/ROCm/flash-attention@howiejay/navi_support"
         default = "git+https://github.com/Disty0/flash-attention@navi_rotary_fix"
@@ -272,7 +274,10 @@ def refresh():
         except Exception:
             rocblas_tensile_libpath = None
             blaslt_tensile_libpath = None
-        spawn(["rocm-sdk", "init"])
+        """
+        rocm_sdk_devel is gone, not pulled any longer in this state.
+        run(["rocm-sdk", "init"])
+        """
     except ImportError:
         rocm_sdk = None
         environment = find()
@@ -300,10 +305,10 @@ if sys.platform == "win32":
         # newer drivers ship amdhip64 that depends on sdk dlls such as rocm_kpack.dll
         env = os.environ.copy()
         if isinstance(environment, PythonPackageEnvironment):
-            env["PATH"] = os.path.join(environment.path, env.get("PATH", ""))
+            env["PATH"] = os.pathsep.join((environment.path, env.get("PATH", "")))
         elif isinstance(environment, ROCmEnvironment):
-            env["PATH"] = os.path.join(environment.path, "bin", env.get("PATH", ""))
-        out = spawn([sys.executable, name], env=env)
+            env["PATH"] = os.pathsep.join((os.path.join(environment.path, "bin"), env.get("PATH", "")))
+        out = run([sys.executable, name], env=env)[0].stdout
         os.unlink(name)
         out = out.strip()
         if out == "":
@@ -377,12 +382,17 @@ if sys.platform == "win32":
     is_wsl: bool = False
 else: # sys.platform != "win32"
     def get_agents() -> list[Agent]:
-        try:
-            _agents = spawn("rocm_agent_enumerator").split("\n")
-            _agents = [x for x in _agents if x and x != 'gfx000']
-        except Exception: # old version of ROCm WSL doesn't have rocm_agent_enumerator
-            _agents = spawn("rocminfo").split("\n")
-            _agents = [x.strip().split(" ")[-1] for x in _agents if x.startswith('  Name:') and "CPU" not in x]
+        output: str | None = None
+        if shutil.which("rocm_agent_enumerator") is not None:
+            try:
+                output = run(["rocm_agent_enumerator"])[0].stdout
+            except FileNotFoundError:
+                pass
+        if output is None:
+            output = run(["rocminfo"])[0].stdout
+            _agents = [x.strip().split(" ")[-1] for x in output.split("\n") if x.startswith('  Name:') and "CPU" not in x]
+        else:
+            _agents = [x for x in output.split("\n") if x and x != 'gfx000']
         agents = [Agent(x) for x in _agents]
         configure_xnack(agents)
         return agents
@@ -409,7 +419,10 @@ else: # sys.platform != "win32"
             return False, e
         return True, None
 
-    is_wsl: bool = os.environ.get('WSL_DISTRO_NAME', 'unknown' if spawn('wslpath -w /') else None) is not None
+    is_wsl: bool = os.environ.get('WSL_DISTRO_NAME') is not None
+    if not is_wsl and shutil.which('wslpath') is not None:
+        is_wsl = bool(run(['wslpath', '-w', '/'])[0].stdout)
+
 
 environment: Environment | None = None
 rocblas_tensile_libpath: str | None = None
@@ -417,6 +430,7 @@ blaslt_tensile_libpath: str | None = None
 is_installed: bool = False
 version: str | None = None
 refresh()
+
 
 # amdgpu-arch.exe written in Python
 CODE_AMDGPU_ARCH = """

@@ -4,6 +4,7 @@ from modules import shared, modelloader, ui_symbols, ui_common, sd_samplers
 from modules.logger import log
 from modules.ui_components import ToolButton
 from modules.caption import caption
+from modules.video_models.video_codecs import DEFAULT_VIDEO_CODEC, get_video_type_choices
 
 
 _save_timer = None
@@ -128,8 +129,7 @@ def create_video_inputs(tab:str, show_always:bool=False):
             gr.update(visible=video_type not in ['None', 'GIF', 'PNG'] or show_always),
         ]
     with gr.Row():
-        video_codecs = ['None', 'GIF', 'PNG', 'MP4/MP4V', 'MP4/AVC1', 'MP4/JVT3', 'MKV/H264', 'AVI/DIVX', 'AVI/RGBA', 'MJPEG/MJPG', 'MPG/MPG1', 'AVR/AVR1']
-        video_type = gr.Dropdown(label='Video format', choices=video_codecs, value='MP4/MP4V', elem_id=f"{tab}_video_type")
+        video_type = gr.Dropdown(label='Video codec', choices=get_video_type_choices(), value=DEFAULT_VIDEO_CODEC, elem_id=f"{tab}_video_type")
     with gr.Row():
         video_duration = gr.Slider(label='Video duration', minimum=0.25, maximum=300, step=0.25, value=2, visible=show_always, elem_id=f"{tab}_video_duration")
         video_loop = gr.Checkbox(label='Loop video', value=True, visible=show_always, elem_id=f"{tab}_video_loop")
@@ -506,12 +506,12 @@ def create_sampler_options(tabname):
     def set_sampler_defaults(name):
         if name == 'Default':
             values = {
-                field[0]: saved_defaults.get(field[0], shared.opts.get_default(field[0]))
+                field[0]: shared.opts.get_default(field[0])
                 for field in ui_fields
                 if field[0] not in {'sampler_presets', 'sampler_options'}
             }
             values.update({
-                key: saved_defaults.get(key, shared.opts.get_default(key))
+                key: shared.opts.get_default(key)
                 for key in (
                     'schedulers_use_loworder',
                     'schedulers_use_thresholding',
@@ -519,7 +519,9 @@ def create_sampler_options(tabname):
                     'schedulers_rescale_betas',
                 )
             })
-            shared.opts.schedulers_beta_schedule = values['schedulers_beta_schedule']
+            for key, value in values.items():
+                shared.opts.data[key] = value
+            save_with_debounce()
         else:
             values = sampler_ui_defaults(name)
             if values is None:

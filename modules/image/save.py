@@ -1,13 +1,14 @@
 import os
 import sys
+import json
 import queue
 import datetime as dt
 import threading
+import numpy as np
 import piexif.helper
-from PIL import Image, PngImagePlugin
+from PIL import Image, PngImagePlugin, ImageCms
 from modules import shared, script_callbacks, errors, paths
 from modules.logger import log
-from modules.json_helpers import writefile
 from modules.image.grid import check_grid_size
 from modules.image.namegen import FilenameGenerator
 from modules.image.watermark import set_watermark
@@ -32,114 +33,158 @@ def sanitize_filename_part(text, replace_spaces=True):
     return text
 
 
+save_log_state: dict[str, tuple[int, int]] = {} # log path: next id, file size after the last append
+
+
+def append_save_log(filename: str, exifinfo: str):
+    """One JSON object per line; ids are line numbers, recounted when the file changed outside this process."""
+    fn = os.path.join(paths.data_path, shared.opts.save_log_fn)
+    root, ext = os.path.splitext(fn)
+    fn = (root if ext.lower() in ('.json', '.jsonl') else fn) + '.jsonl'
+    size = os.path.getsize(fn) if os.path.isfile(fn) else 0
+    idx, known = save_log_state.get(fn, (0, -1))
+    prefix = b''
+    if size != known:
+        idx, last = 0, b'\n'
+        if size > 0:
+            with open(fn, 'rb') as f:
+                for chunk in iter(lambda: f.read(1 << 20), b''):
+                    idx += chunk.count(b'\n')
+                    last = chunk[-1:]
+        if last != b'\n': # a torn last line stays a line of its own
+            prefix = b'\n'
+            idx += 1
+    entry = { 'id': idx, 'filename': filename, 'time': dt.datetime.now().isoformat(), 'info': exifinfo }
+    line = prefix + json.dumps(entry).encode('utf8') + b'\n'
+    with open(fn, 'ab') as f:
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+    save_log_state[fn] = (idx + 1, size + len(line))
+    log.info(f'Save: json="{fn}" records={idx + 1}')
+
+
+def save_image_to_file(image, fn, image_format, exifinfo='', pnginfo=None, metadata=True):
+    exifinfo_dump = piexif.helper.UserComment.dump(exifinfo or '', encoding="unicode")
+    if image_format == 'PNG':
+        pnginfo_data = PngImagePlugin.PngInfo()
+        for key, value in (pnginfo or {}).items():
+            if key not in {'icc_profile', 'exif'}:
+                pnginfo_data.add_text(key, str(value))
+        save_args = {
+            'compress_level': 6,
+            'pnginfo': pnginfo_data if metadata else None,
+        }
+    elif image_format == 'JPEG':
+        if image.mode == 'RGBA':
+            log.warning('Save: removing alpha channel')
+            image = image.convert("RGB")
+        elif image.mode == 'I;16':
+            image = image.point(lambda p: p * 0.0038910505836576).convert("L")
+        elif image.mode == 'P':
+            image = image.convert("RGB")
+        save_args = {
+            'optimize': True,
+            'quality': shared.opts.jpeg_quality,
+        }
+        if metadata:
+            save_args['exif'] = piexif.dump({ "Exif": { piexif.ExifIFD.UserComment: exifinfo_dump } })
+    elif image_format in ['WEBP', 'JXL']:
+        if image.mode == 'I;16':
+            image = image.point(lambda p: p * 0.0038910505836576).convert("RGB")
+        elif image_format == 'JXL' and image.mode not in {"RGB", "RGBA"}:
+            image = image.convert("RGBA")
+        save_args = {
+            'optimize': True,
+            'quality': shared.opts.jpeg_quality,
+            'lossless': shared.opts.webp_lossless,
+        }
+        if metadata:
+            save_args['exif'] = piexif.dump({ "Exif": { piexif.ExifIFD.UserComment: exifinfo_dump } })
+    elif image_format == 'HEIF':
+        save_args = {
+            'quality': shared.opts.jpeg_quality,
+            'lossless': shared.opts.webp_lossless,
+        }
+        if metadata:
+            save_args['exif'] = piexif.dump({ "Exif": { piexif.ExifIFD.UserComment: exifinfo_dump } })
+    elif image_format == 'AVIF':
+        # Use full-range 4:2:0 and explicit sRGB to avoid range and color shifts.
+        srgb_profile = ImageCms.createProfile("sRGB")
+        icc_profile = ImageCms.ImageCmsProfile(srgb_profile).tobytes()
+        save_args = {
+            'quality': shared.opts.jpeg_quality,
+            'range': 'full',
+            'subsampling': '4:2:0',
+            'speed': 4,
+            'icc_profile': icc_profile,
+        }
+        if metadata:
+            save_args['exif'] = piexif.dump({ "Exif": { piexif.ExifIFD.UserComment: exifinfo_dump } })
+    else:
+        save_args = { 'quality': shared.opts.jpeg_quality }
+    debug_save(f'Save args: {save_args}')
+    image.save(fn, format=image_format, **save_args)
+    return image
+
+
 def atomically_save_image():
     Image.MAX_IMAGE_PIXELS = None # disable check in Pillow and rely on check below to allow large custom image sizes
     while True:
         image, filename, extension, params, exifinfo, filename_txt, is_grid = save_queue.get()
-        jobid = shared.state.begin('Save image')
-        shared.state.image_history += 1
-        if len(exifinfo) > 2:
-            with open(paths.params_path, "w", encoding="utf8") as file:
-                file.write(exifinfo)
-        fn = filename + extension
-        filename = filename.strip()
-        if extension[0] != '.': # add dot if missing
-            extension = '.' + extension
+        savejob = shared.state.record('Save image')
         try:
-            image_format = Image.registered_extensions()[extension]
-        except Exception:
-            log.warning(f'Save: unknown image format: {extension}')
-            image_format = 'JPEG'
-        exifinfo = (exifinfo or "") if shared.opts.image_metadata else ""
-        # additional metadata saved in files
-        if shared.opts.save_txt and len(exifinfo) > 0:
+            shared.state.image_history += 1
+            if len(exifinfo) > 2:
+                with open(paths.params_path, "w", encoding="utf8") as file:
+                    file.write(exifinfo)
+            fn = filename + extension
+            filename = filename.strip()
+            if extension[0] != '.': # add dot if missing
+                extension = '.' + extension
             try:
-                with open(filename_txt, "w", encoding="utf8") as file:
-                    file.write(f"{exifinfo}\n")
-                log.info(f'Save: text="{filename_txt}" len={len(exifinfo)}')
+                image_format = 'OPENEXR' if extension.lower() == '.exr' else Image.registered_extensions()[extension]
+            except Exception:
+                log.warning(f'Save: unknown image format: {extension}')
+                image_format = 'JPEG'
+            exifinfo = (exifinfo or "") if shared.opts.image_metadata else ""
+            # additional metadata saved in files
+            if shared.opts.save_txt and len(exifinfo) > 0:
+                try:
+                    with open(filename_txt, "w", encoding="utf8") as file:
+                        file.write(f"{exifinfo}\n")
+                    log.info(f'Save: text="{filename_txt}" len={len(exifinfo)}')
+                except Exception as e:
+                    log.warning(f'Save failed: description={filename_txt} {e}')
+
+            # actual save
+            try:
+                if image_format == 'OPENEXR':
+                    from modules.image.exr import save_exr
+                    rgb = np.asarray(image.convert('RGB'), dtype=np.float32) / 255.0
+                    linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
+                    save_exr(fn, linear, 'rec.709')
+                else:
+                    image = save_image_to_file(image, fn, image_format, exifinfo=exifinfo, pnginfo=params.pnginfo, metadata=shared.opts.image_metadata)
             except Exception as e:
-                log.warning(f'Save failed: description={filename_txt} {e}')
+                log.error(f'Save failed: file="{fn}" format={image_format} {e}')
+                errors.display(e, 'Image save')
+            size = os.path.getsize(fn) if os.path.exists(fn) else 0
+            what = 'grid' if is_grid else 'image'
+            log.info(f'Save: {what}="{fn}" type={image_format} width={image.width} height={image.height} size={size} quality={shared.opts.jpeg_quality}')
+            savejob.outputs.append(fn)
 
-        # actual save
-        exifinfo_dump = piexif.helper.UserComment.dump(exifinfo, encoding="unicode")
-        if image_format == 'PNG':
-            pnginfo_data = PngImagePlugin.PngInfo()
-            for k, v in params.pnginfo.items():
-                pnginfo_data.add_text(k, str(v))
-            debug_save(f'Save pnginfo: {params.pnginfo.items()}')
-            save_args = {
-                'compress_level': 6,
-                'pnginfo': pnginfo_data if shared.opts.image_metadata else None,
-            }
-        elif image_format == 'JPEG':
-            if image.mode == 'RGBA':
-                log.warning('Save: removing alpha channel')
-                image = image.convert("RGB")
-            elif image.mode == 'I;16':
-                image = image.point(lambda p: p * 0.0038910505836576).convert("L")
-            save_args = {
-                'optimize': True,
-                'quality': shared.opts.jpeg_quality,
-            }
-            if shared.opts.image_metadata:
-                debug_save(f'Save exif: {exifinfo}')
-                save_args['exif'] = piexif.dump({ "Exif": { piexif.ExifIFD.UserComment: exifinfo_dump } })
-        elif image_format == 'WEBP':
-            if image.mode == 'I;16':
-                image = image.point(lambda p: p * 0.0038910505836576).convert("RGB")
-            save_args = {
-                'optimize': True,
-                'quality': shared.opts.jpeg_quality,
-                'lossless': shared.opts.webp_lossless,
-            }
-            if shared.opts.image_metadata:
-                debug_save(f'Save exif: {exifinfo}')
-                save_args['exif'] = piexif.dump({ "Exif": { piexif.ExifIFD.UserComment: exifinfo_dump } })
-        elif image_format == 'JXL':
-            if image.mode == 'I;16':
-                image = image.point(lambda p: p * 0.0038910505836576).convert("RGB")
-            elif image.mode not in {"RGB", "RGBA"}:
-                image = image.convert("RGBA")
-            save_args = {
-                'optimize': True,
-                'quality': shared.opts.jpeg_quality,
-                'lossless': shared.opts.webp_lossless,
-            }
-            if shared.opts.image_metadata:
-                debug_save(f'Save exif: {exifinfo}')
-                save_args['exif'] = piexif.dump({ "Exif": { piexif.ExifIFD.UserComment: exifinfo_dump } })
-        elif image_format == 'HEIF':
-            save_args = { 'quality': shared.opts.jpeg_quality }
-            if shared.opts.image_metadata:
-                debug_save(f'Save exif: {exifinfo}')
-                save_args['exif'] = piexif.dump({ "Exif": { piexif.ExifIFD.UserComment: exifinfo_dump } })
-        else:
-            save_args = { 'quality': shared.opts.jpeg_quality }
-        try:
-            debug_save(f'Save args: {save_args}')
-            image.save(fn, format=image_format, **save_args)
-        except Exception as e:
-            log.error(f'Save failed: file="{fn}" format={image_format} args={save_args} {e}')
+            if shared.opts.save_log_fn != '' and len(exifinfo) > 0:
+                try:
+                    append_save_log(filename, exifinfo)
+                except Exception as e:
+                    log.error(f'Save failed: json="{shared.opts.save_log_fn}" {e}')
+        except Exception as e: # one failed save must not stop the thread every later save waits on
+            log.error(f'Save failed: file="{filename}{extension}" {e}')
             errors.display(e, 'Image save')
-        size = os.path.getsize(fn) if os.path.exists(fn) else 0
-        what = 'grid' if is_grid else 'image'
-        log.info(f'Save: {what}="{fn}" type={image_format} width={image.width} height={image.height} size={size}')
-
-        if shared.opts.save_log_fn != '' and len(exifinfo) > 0:
-            fn = os.path.join(paths.data_path, shared.opts.save_log_fn)
-            if not fn.endswith('.json'):
-                fn += '.json'
-            entries = shared.readfile(fn, silent=True)
-            if not isinstance(entries, list):
-                entries = []
-            idx = len(entries)
-            entry = { 'id': idx, 'filename': filename, 'time': dt.datetime.now().isoformat(), 'info': exifinfo }
-            entries.append(entry)
-            writefile(entries, fn, mode='w', silent=True)
-            log.info(f'Save: json="{fn}" records={len(entries)}')
-        shared.state.outputs(filename)
-        shared.state.end(jobid)
-        save_queue.task_done()
+        finally:
+            savejob.end()
+            save_queue.task_done()
 
 
 save_queue: queue.Queue[tuple[Image.Image, str, str, script_callbacks.ImageSaveParams, str, str | None, bool]] = queue.Queue()
@@ -175,6 +220,7 @@ def save_image(image,
         return None, None, None
     if path is None or path == '': # set default path to avoid errors when functions are triggered manually or via api and param is not set
         path = paths.resolve_output_path(shared.opts.outdir_samples, shared.opts.outdir_save)
+    base = path
     namegen = FilenameGenerator(p, seed, prompt, image, grid=grid)
     suffix = suffix if suffix is not None else ''
     basename = '' if basename is None else basename
@@ -210,12 +256,12 @@ def save_image(image,
     image = set_watermark(image, wm_text, wm_image)
 
     params = script_callbacks.ImageSaveParams(image, p, filename, pnginfo)
-    params.filename = namegen.sanitize(filename)
+    params.filename = namegen.sanitize(filename, base=base)
     dirname = os.path.dirname(params.filename)
     if dirname is not None and len(dirname) > 0:
         os.makedirs(dirname, exist_ok=True)
     params.filename = namegen.sequence(params.filename)
-    params.filename = namegen.sanitize(params.filename)
+    params.filename = namegen.sanitize(params.filename, base=base)
     # callbacks
     script_callbacks.before_image_saved_callback(params)
     exifinfo = params.pnginfo.get('UserComment', '')

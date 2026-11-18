@@ -1,4 +1,5 @@
 from threading import Lock
+from fastapi.exceptions import HTTPException
 from fastapi.responses import JSONResponse
 from modules import errors, shared, scripts_manager
 from modules.api import models, script, helpers
@@ -120,14 +121,17 @@ class APIGenerate:
                 processed = process_images(p)
             processed = scripts_manager.scripts_txt2img.after(p, processed, *script_args)
             p.close()
+            error = shared.state.error # read under the lock: the next job's begin clears it
             shared.state.end(jobid, api=False)
         if processed is None or processed.images is None or len(processed.images) == 0:
+            if error:
+                raise HTTPException(status_code=500, detail=error)
             b64images = []
         else:
             b64images = list(map(helpers.encode_pil_to_base64, processed.images)) if send_images else []
         self.sanitize_b64(txt2imgreq)
         info = processed.js() if processed else ''
-        return models.ResTxt2Img(images=b64images, parameters=vars(txt2imgreq), info=info)
+        return models.ResTxt2Img(images=b64images, parameters=vars(txt2imgreq), info=info, error=error or None)
 
     def post_img2img(self, img2imgreq: models.ReqImg2Img):
         """Generate images from input images with optional inpainting mask. Supports IP-Adapter, FaceID, and script overrides."""
@@ -173,8 +177,11 @@ class APIGenerate:
                 processed = process_images(p)
             processed = scripts_manager.scripts_img2img.after(p, processed, *script_args)
             p.close()
+            error = shared.state.error # read under the lock: the next job's begin clears it
             shared.state.end(jobid, api=False)
         if processed is None or processed.images is None or len(processed.images) == 0:
+            if error:
+                raise HTTPException(status_code=500, detail=error)
             b64images = []
         else:
             b64images = list(map(helpers.encode_pil_to_base64, processed.images)) if send_images else []
@@ -183,4 +190,4 @@ class APIGenerate:
             img2imgreq.mask = None
         self.sanitize_b64(img2imgreq)
         info = processed.js() if processed else ''
-        return models.ResImg2Img(images=b64images, parameters=vars(img2imgreq), info=info)
+        return models.ResImg2Img(images=b64images, parameters=vars(img2imgreq), info=info, error=error or None)

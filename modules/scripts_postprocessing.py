@@ -5,12 +5,15 @@ from modules.logger import log
 
 
 class PostprocessedImage:
-    def __init__(self, image = None, video = None, info = None):
+    def __init__(self, image = None, video = None, info = None, output_dir = None, source_path = None, save_output = True):
         if info is None:
             info = {}
         self.image = image
         self.video = video
         self.info = info
+        self.output_dir = output_dir
+        self.source_path = source_path
+        self.save_output = save_output
 
     def __str__(self):
         return f'PostprocessedImage(image={self.image} video={self.video} info={self.info})'
@@ -126,9 +129,16 @@ class ScriptPostprocessingRunner:
             else:
                 for (name, _component), value in zip(script.controls.items(), script_args, strict=False):
                     process_kwargs[name] = value
-            log.debug(f'Process: script="{script.name}" args={process_args} kwargs={process_kwargs}')
-            script.process(pp, *process_args, **process_kwargs)
-            shared.state.end(jobid)
+            clean_kwargs = {k: v for k, v in process_kwargs.items() if v is not None}
+            try:
+                if len(list(clean_kwargs)) + len(process_args) > 0:
+                    log.debug(f'Process: script="{script.name}" args={process_args} kwargs={clean_kwargs}')
+                    script.process(pp, *process_args, **process_kwargs)
+                else:
+                    pass
+                    # log.debug(f'Process: script="{script.name}" skip')
+            finally:
+                shared.state.end(jobid)
 
     def create_args_for_run(self, scripts_args):
         if not self.ui_created:

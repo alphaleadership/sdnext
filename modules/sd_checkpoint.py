@@ -212,6 +212,7 @@ def remove_hash(s):
 
 def get_closest_checkpoint_match(s: str) -> CheckpointInfo | None:
     # direct hf url
+    s = s.strip()
     if s.startswith('https://huggingface.co/'):
         model_name = s.replace('https://huggingface.co/', '')
         checkpoint_info = CheckpointInfo(model_name) # create a virtual model info
@@ -316,6 +317,7 @@ def select_checkpoint(op='model', sd_model_checkpoint=None):
     model_checkpoint = sd_model_checkpoint or (shared.opts.data.get('sd_model_refiner', None) if op == 'refiner' else shared.opts.data.get('sd_model_checkpoint', None))
     if model_checkpoint is None or model_checkpoint == 'None' or len(model_checkpoint) < 3:
         return None
+    model_checkpoint = model_checkpoint.strip()
     checkpoint_info = get_closest_checkpoint_match(model_checkpoint)
     if checkpoint_info is not None:
         log.info(f'Load {op}: select="{checkpoint_info.title if checkpoint_info is not None else None}"')
@@ -330,7 +332,7 @@ def select_checkpoint(op='model', sd_model_checkpoint=None):
             log.info("  or use --ckpt <path-to-checkpoint> to force using specific model")
         return None
     if model_checkpoint is not None:
-        if model_checkpoint != 'model.safetensors' and model_checkpoint != 'stabilityai/stable-diffusion-xl-base-1.0':
+        if (model_checkpoint != 'model.safetensors') and (model_checkpoint != 'stabilityai/stable-diffusion-xl-base-1.0'):
             log.error(f'Load {op}: search="{model_checkpoint}" not found')
         else:
             log.info("Selecting first available checkpoint")

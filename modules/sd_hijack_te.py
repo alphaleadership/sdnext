@@ -1,56 +1,98 @@
 import os
 import time
 import contextlib
+import collections
 from functools import wraps
 import torch
-from modules import shared, errors, timer, sd_models
+from modules import shared, timer, sd_models, devices
 from modules.logger import log
 from modules.attention import context as attention_context
 
 
+def freeze(value):
+    """Hashable form of a plain encode argument; tensors, images and other objects raise TypeError."""
+    if value is None or isinstance(value, (str, int, float, bool, torch.device, torch.dtype)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze(item) for item in value)
+    if isinstance(value, dict):
+        return tuple((key, freeze(item)) for key, item in sorted(value.items()))
+    raise TypeError(type(value).__name__)
+
+
+class HostTensor:
+    """Cached tensor held in host memory with the device it is returned to."""
+    def __init__(self, tensor: torch.Tensor):
+        self.device = tensor.device
+        self.tensor = tensor.to(devices.cpu, copy=True)
+
+
+def to_host(value):
+    """Host copy of an encode result; an object it cannot copy raises TypeError, which leaves the result uncached."""
+    if isinstance(value, torch.Tensor):
+        return HostTensor(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if type(value) in (list, tuple):
+        return type(value)(to_host(item) for item in value)
+    if type(value) is dict:
+        return {key: to_host(item) for key, item in value.items()}
+    raise TypeError(type(value).__name__)
+
+
+def from_host(value):
+    """Copy of a cached result with each tensor back on its original device."""
+    if isinstance(value, HostTensor):
+        return value.tensor.to(value.device, copy=True)
+    if type(value) in (list, tuple):
+        return type(value)(from_host(item) for item in value)
+    if type(value) is dict:
+        return {key: from_host(item) for key, item in value.items()}
+    return value
+
+
 class PromptCache:
+    """Encode results in host memory, sized by *Text encoder cache size*, least recently used evicted first."""
     def __init__(self):
-        self.cache = {}
+        self.cache = collections.OrderedDict()
         self.id = None
-        self.max = 16
 
     @staticmethod
-    def _hashable(val):
-        if isinstance(val, list):
-            return tuple(val)
-        return val
+    def key(args, kwargs):
+        """Key over every argument of the encode call; None when one is not a plain value, which leaves the call uncached."""
+        try:
+            return freeze(args), freeze(kwargs)
+        except TypeError:
+            return None
 
-    def get(self, prompt, negative_prompt=None, cfg_enabled=None):
+    def get(self, key, prompt=None):
         current_id = id(shared.sd_model.sd_checkpoint_info) if hasattr(shared.sd_model, 'sd_checkpoint_info') else id(shared.sd_model)
         if self.id != current_id:
             self.cache.clear()
             self.id = current_id
             log.debug(f'Encode: prompt cache activate id={self.id} depth={len(self.cache)}')
-        negative_prompt = self._hashable(negative_prompt)
-        if (isinstance(prompt, list) and len(prompt) == 1 and isinstance(prompt[0], str)):
-            cached = self.cache.get((prompt[0], negative_prompt, cfg_enabled), None)
-        elif isinstance(prompt, str):
-            cached = self.cache.get((prompt, negative_prompt, cfg_enabled), None)
+        if key is None or key not in self.cache:
+            return None
+        self.cache.move_to_end(key)
+        if isinstance(prompt, list):
+            length = sum(len(p) for p in prompt if isinstance(p, str))
+            log.debug(f'Encode: length={length} cache={len(self.cache)} prompt={prompt}')
         else:
-            cached = None
-        if cached:
-            if isinstance(prompt, list):
-                length = sum(len(p) for p in prompt if isinstance(p, str))
-                log.debug(f'Encode: length={length} cache={len(self.cache)} prompt={prompt}')
-            else:
-                length = len(prompt) if isinstance(prompt, str) else 0
-                log.debug(f'Encode: length={length} cache={len(self.cache)} prompt="{prompt}"')
-        return cached
+            length = len(prompt) if isinstance(prompt, str) else 0
+            log.debug(f'Encode: length={length} cache={len(self.cache)} prompt="{prompt}"')
+        return from_host(self.cache[key])
 
-    def set(self, prompt, encoded, negative_prompt=None, cfg_enabled=None):
-        if len(self.cache) >= self.max:
-            oldest_key = next(iter(self.cache))
-            del self.cache[oldest_key]
-        negative_prompt = self._hashable(negative_prompt)
-        if (isinstance(prompt, list) and len(prompt) == 1 and isinstance(prompt[0], str)):
-            self.cache[(prompt[0], negative_prompt, cfg_enabled)] = encoded
-        elif isinstance(prompt, str):
-            self.cache[(prompt, negative_prompt, cfg_enabled)] = encoded
+    def set(self, key, encoded):
+        size = int(shared.opts.sd_textencoder_cache_size)
+        if key is None or size < 1:
+            return
+        try:
+            self.cache[key] = to_host(encoded)
+        except TypeError:
+            return
+        self.cache.move_to_end(key)
+        while len(self.cache) > size:
+            self.cache.popitem(last=False)
 
 
 prompt_cache = PromptCache()
@@ -87,7 +129,6 @@ def hijack_encode_prompt(*args, **kwargs):
             prompt = args_copy[0]
             patch_prompt = True
         prompt = [p.strip(", \n") if isinstance(p, str) else p for p in prompt] if isinstance(prompt, list) else prompt
-        res = prompt
 
         if hasattr(shared.sd_model, 'before_prompt_encode'):
             log.debug('Encode: op=before')
@@ -95,11 +136,8 @@ def hijack_encode_prompt(*args, **kwargs):
             if patch_prompt:
                 args_copy[0] = prompt
 
-        # cache key must include cfg-affecting kwargs since encode_prompt output may or may not include negative embeddings
-        negative_prompt = kwargs.get('negative_prompt', None)
-        cfg_enabled = kwargs.get('do_classifier_free_guidance', None) or kwargs.get('guidance_scale', 0) > 1
-        cacheable = kwargs.get('image', None) is None
-        cached = prompt_cache.get(prompt, negative_prompt, cfg_enabled) if cacheable else None
+        key = prompt_cache.key(args_copy, kwargs) # pipelines pass size, image and guidance arguments that change the result
+        cached = prompt_cache.get(key, prompt)
         if cached is not None:
             res = cached
         else:
@@ -114,22 +152,18 @@ def hijack_encode_prompt(*args, **kwargs):
                     res = shared.sd_model.orig_encode_prompt(*args_copy, **kwargs)
                 else:
                     res = shared.sd_model.encode_prompt(*args_copy, **kwargs)
-            if cacheable:
-                prompt_cache.set(prompt, res, negative_prompt, cfg_enabled)
+            prompt_cache.set(key, res)
 
         if hasattr(shared.sd_model, 'after_prompt_encode'):
             log.debug('Encode: op=after')
             res = shared.sd_model.after_prompt_encode(res)
-
-    except Exception as e:
-        log.error(f'Encode prompt: {e}')
-        errors.display(e, 'Encode prompt')
-    t1 = time.time()
-    timer.process.add('te', t1-t0)
-    if t1 - t0 > 10:
-        log.warning(f'Encode: time={t1-t0:.3f} long encode prompt')
-    shared.sd_model = sd_models.apply_balanced_offload(shared.sd_model)
-    shared.state.end(jobid)
+    finally: # an encode failure propagates: the pipeline has no embeddings to continue with
+        t1 = time.time()
+        timer.process.add('te', t1-t0)
+        if t1 - t0 > 10:
+            log.warning(f'Encode: time={t1-t0:.3f} long encode prompt')
+        shared.sd_model = sd_models.apply_balanced_offload(shared.sd_model)
+        shared.state.end(jobid)
     # from modules import memstats
     # log.debug(f'Encode: memory={memstats.memory_stats()}')
     return res

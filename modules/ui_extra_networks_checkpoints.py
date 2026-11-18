@@ -37,6 +37,7 @@ version_map = {
     "Flux3": "Flux 3 Klein",
     "Flux3Distilled": "Flux 3 Klein",
     "Flux-3": "Flux 3 Klein",
+    "MiniMaxH3Image": "MiniMax H3 Image",
     "MiniMaxH3": "MiniMax H3",
     "MiniMax_H3": "MiniMax H3",
     "ZImageTurbo": "Z-Image",
@@ -184,6 +185,8 @@ class ExtraNetworksPageCheckpoints(ui_extra_networks.ExtraNetworksPage):
                 log.debug(f'Local model: name="{checkpoint.name}" version="{version}"')
             else:
                 log.warning(f'Local model: name="{checkpoint.name}" version="{version}"')
+                log.warning(f'Local model: checkpoint="{checkpoint}"')
+                log.warning(f'Local model: record="{record}"')
         return version
 
     def create_item(self, name):

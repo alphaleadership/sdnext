@@ -28,7 +28,7 @@ class Torch(dict):
 
 
 # target commit hashes for specific packages
-diffusers_target = '06a9cfb86ae8aa69c6a220ba0da0f37b819dde6a' # diffusers commit hash == 0.42.0.dev == 10-27-2026
+diffusers_target = '8069682140c675652a886736121f4e3b86f4187c' # diffusers commit hash == 0.42.0.dev == 10-27-2026
 transformers_target = 'c0d024fbc873ab0325e1b40fc1bd69069609de65' # transformers commit hash == 5.21.0.dev == 10-27-2026
 sdnq_target = '8bf23dffa1da84cbf1989bdec4a4fc2adc3e2e5f' # sdnq commit hash == 0.2.9.dev == 10-27-2026
 
@@ -209,6 +209,8 @@ def installed(package, friendly: str | None = None, quiet = False): # pylint: di
             pkgs = [p for p in package.split() if not p.startswith('-') and not p.startswith('=') and not p.startswith('git+')]
             pkgs = [p.split('/')[-1] for p in pkgs] # get only package name if installing from url
         for pkg in pkgs:
+            if pkg is None or pkg == '':
+                continue
             if '!=' in pkg:
                 p = pkg.split('!=')
                 return True # check for not equal always return true
@@ -216,6 +218,8 @@ def installed(package, friendly: str | None = None, quiet = False): # pylint: di
                 p = pkg.split('>=')
             else:
                 p = pkg.split('==')
+            if p[0] is None or p[0] == '':
+                continue
             spec = package_spec(p[0])
             ok = ok and spec is not None
             if ok:
@@ -249,7 +253,10 @@ def uninstall(package, quiet = False):
         if installed(p, p, quiet=True):
             if not quiet:
                 log.warning(f'Package: {p} uninstall')
-            _result, _txt = pip(f"uninstall {p} --yes --quiet", ignore=True, quiet=True, uv=False)
+            if args.uv:
+                _result, _txt = pip(f"uninstall {p} --quiet", ignore=True, quiet=True)
+            else:
+                _result, _txt = pip(f"uninstall {p} --yes --quiet", ignore=True, quiet=True)
             txt += _txt
     ts('uninstall', t_start)
     return txt
@@ -286,21 +293,41 @@ def uv_info():
     log.debug(f'Package manager: app=uv version="{uv_version}" folder="{uv_cache_dir}" dedup={uv_cache_active}')
 
 
-def run(cmd: str, *nargs: str, **kwargs):
+def run(cmd: str | list[str], *nargs: str, **kwargs):
     options = {
         "check": False,
         "env": os.environ,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
     }
     options |= kwargs  # Override defaults with passed kwargs
-    argstr = " ".join(nargs)
-    result = subprocess.run(f'"{cmd}" {argstr}', **options, shell=True, capture_output=True, text=True)
-    result.stdout = result.stdout.strip()
-    result.stderr = result.stderr.strip()
-    txt = result.stdout
-    if result.stderr:
-        # Put newline between outputs only if stdout isn't empty
-        txt += "\n" + result.stderr if txt else result.stderr
-    return result, txt
+    which = shutil.which(cmd if isinstance(cmd, str) else cmd[0])
+    if which is None:
+        log.warning(f'Run: command="{cmd}" not found in PATH')
+    debug(f'Run: command="{cmd}" abs="{which}" nargs={nargs} kwargs={kwargs}')
+    try:
+        if isinstance(cmd, list):
+            result = subprocess.run(cmd + list(nargs), **options, shell=False, text=True)
+        else:
+            argstr = " ".join(nargs)
+            result = subprocess.run(f'"{cmd}" {argstr}', **options, shell=True, text=True)
+    except FileNotFoundError:
+        cwd = options.get("cwd")
+        if cwd is not None and not os.path.isdir(cwd):
+            message = f'Run: folder="{cwd}" not found'
+        else:
+            executable = cmd[0] if isinstance(cmd, list) and cmd else cmd
+            message = f'Run: executable="{executable}" not found'
+        log.error(message)
+        raise FileNotFoundError(message) from None
+    except Exception as e:
+        log.error(f'Run: command="{cmd}" abs="{which}" exception: {str(e)}')
+        raise
+    stdout = (result.stdout or '').strip()
+    stderr = (result.stderr or '').strip()
+    if stderr:
+        stdout += "\n" + stderr if stdout else stderr # Put newline between outputs only if stdout isn't empty
+    return result, stdout
 
 
 def cleanup_broken_packages():
@@ -321,6 +348,52 @@ def cleanup_broken_packages():
                     shutil.rmtree(dist_info, ignore_errors=True)
     except Exception:
         pass
+
+
+def install_progress() -> bool:
+    """Live progress needs the log console on a terminal; SD_INSTALL_DEBUG keeps full capture instead"""
+    if os.environ.get('SD_INSTALL_DEBUG', None) is not None:
+        return False
+    try:
+        from modules.logger import console
+        return console is not None and console.is_terminal
+    except Exception:
+        return False
+
+
+def pip_raw_progress() -> bool:
+    """pip 24.1 added --progress-bar raw"""
+    try:
+        major, minor = (package_version('pip') or '0.0').split('.')[:2]
+        return (int(major), int(minor)) >= (24, 1)
+    except Exception:
+        return False
+
+
+def pip_progress(cmdline: str, label: str) -> tuple[subprocess.CompletedProcess, str]:
+    """Run pip with raw progress on a pipe and draw it as a download bar on the log console"""
+    from rich.progress import Progress, TextColumn, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
+    from modules.logger import console
+    lines = []
+    with subprocess.Popen(cmdline, shell=True, env=os.environ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', bufsize=1) as proc:
+        with Progress(TextColumn('[cyan]{task.description}'), BarColumn(bar_width=None), DownloadColumn(), TransferSpeedColumn(), TimeRemainingColumn(), console=console, transient=True) as progress:
+            task = progress.add_task(description=f'Install: {label[:48]}', total=None)
+            for line in (proc.stdout or []):
+                line = line.strip()
+                if line.startswith('Progress '): # raw mode prints "Progress <done> of <total>" per chunk
+                    parts = line.split()
+                    if len(parts) == 4 and parts[1].isdigit() and parts[3].isdigit():
+                        progress.update(task, completed=int(parts[1]), total=int(parts[3]))
+                    continue
+                lines.append(line)
+                phase = line.split(' (')[0]
+                if phase.startswith('Downloading '): # wheel name without python and platform tags
+                    phase = 'Downloading ' + '-'.join(os.path.basename(phase[12:]).split('-')[:2])
+                if phase.startswith(('Collecting ', 'Downloading ', 'Building wheel for ', 'Cloning ', 'Installing collected packages')):
+                    progress.update(task, description=phase[:48])
+        returncode = proc.wait()
+    result = subprocess.CompletedProcess(cmdline, returncode, stdout='\n'.join(lines), stderr='')
+    return result, result.stdout
 
 
 def pip(arg: str, ignore: bool = False, quiet: bool = True, *, uv = True, constraints = True) -> tuple[subprocess.CompletedProcess | None, str]:
@@ -348,17 +421,19 @@ def pip(arg: str, ignore: bool = False, quiet: bool = True, *, uv = True, constr
     if not quiet:
         log.debug(f'Running: {pipCmd}="{" ".join(all_args)}"')
 
+    progress = install_progress()
     if uv:
-        result, output = run("uv", "pip", *all_args)
+        result, output = run("uv", "pip", *all_args, f'--python "{sys.executable}"', stderr=None if progress else subprocess.PIPE) # uv draws its own progress when stderr is the terminal
+    elif progress and arg.startswith('install') and pip_raw_progress():
+        result, output = pip_progress(f'"{sys.executable}" -m pip {" ".join(all_args)} --progress-bar raw', package)
     else:
         result, output = run(sys.executable, "-m", pipCmd, *all_args)
 
-    if len(result.stderr) > 0:
-        if uv and result.returncode != 0:
-            log.warning(f'Install: cmd="{pipCmd}" args="{" ".join(all_args)}" cannot use uv, fallback to pip')
-            debug(f'Install: uv pip error: {result.stderr}')
-            cleanup_broken_packages()
-            return pip(originalArg, ignore, quiet, uv=False)
+    if uv and result.returncode != 0:
+        log.warning(f'Install: cmd="{pipCmd}" args="{" ".join(all_args)}" cannot use uv, fallback to pip')
+        debug(f'Install: uv pip error: {output}')
+        cleanup_broken_packages()
+        return pip(originalArg, ignore, quiet, uv=False)
     if os.environ.get('SD_INSTALL_DEBUG', None) is not None:
         log.debug(f'PIP cmd="{pipCmd}": {output}')
     if result.returncode != 0 and not ignore:
@@ -381,7 +456,7 @@ def install(package, friendly: str | None = None, ignore: bool = False, reinstal
         deps = '' if not no_deps else '--no-deps '
         isolation = '' if not no_build_isolation else '--no-build-isolation '
         cmd = f"install{' --upgrade' if not args.uv else ''}{' --force-reinstall' if force else ''} {deps}{isolation}{package}"
-        res = pip(cmd, ignore=ignore, uv=package != "uv" and not package.startswith('git+'))
+        res = pip(cmd, ignore=ignore, uv=package != "uv")
     ts('install', t_start)
     return res
 
@@ -402,15 +477,33 @@ def git(arg: str, folder: str | None= None, ignore: bool = False, optional: bool
             folder = 'root'
         if "couldn't find remote ref" in txt: # not a git repo
             log.error(f'Git: folder="{folder}" could not identify repository')
+            errors.append(f'git: {folder}')
         elif "no submodule mapping found" in txt:
             log.warning(f'Git: folder="{folder}" submodules changed')
+            errors.append(f'git: {folder}')
         elif 'or stash them' in txt:
             log.warning(f'Git: folder="{folder}" local changes detected')
+            if folder != '.':
+                errors.append(f'git: {folder}')
         else:
             log.error(f'Git: folder="{folder}" arg="{arg}" output={txt}')
-        errors.append(f'git: {folder}')
+            errors.append(f'git: {folder}')
     ts('git', t_start)
     return txt
+
+
+def git_branch_commit(folder: str = ".") -> tuple[str, str]:
+    result, _ = run(["git", "status", "--porcelain=v2", "--branch", "--untracked-files=no"], check=True, cwd=folder)
+    branch_name = None
+    commit_hash = None
+    for line in result.stdout.splitlines():
+        if line.startswith("# branch.head "):
+            branch_name = line.removeprefix("# branch.head ")
+        elif line.startswith("# branch.oid "):
+            commit_hash = line.removeprefix("# branch.oid ")
+    if branch_name is None or commit_hash is None or commit_hash == "(initial)":
+        raise RuntimeError(f'Git: unable to read branch and commit: folder="{folder}"')
+    return ("HEAD" if branch_name in {"detached", "(detached)"} else branch_name), commit_hash
 
 
 # reattach as needed as head can get detached
@@ -437,9 +530,9 @@ def branch(folder=None):
     if args.experimental or args.skip_git or args.skip_all:
         return b
 
-    if 'main' in b:
+    if b == 'main':
         tgt = 'main'
-    elif 'master' in b:
+    elif b == 'master':
         tgt = 'master'
     else:
         tgt = b.split('\n')[0].replace('*', '').strip()
@@ -514,6 +607,7 @@ def clone(url, folder, commithash=None):
     ts('clone', t_start)
 
 
+@lru_cache
 def get_platform():
     try:
         if platform.system() == 'Windows':
@@ -524,13 +618,10 @@ def get_platform():
             'arch': platform.machine(),
             'cpu': f'"{platform.processor()}"',
             'system': f'"{platform.system()}"',
-            'release': release,
-            'python': platform.python_version(),
+            'release': f'"{release}"',
             'locale': locale.getlocale(),
-            'setuptools': package_version('setuptools'),
             'docker': os.environ.get('SD_DOCKER', None) is not None,
-            'pip': package_version('pip'),
-            'uv': package_version('uv'),
+            'wsl': os.environ.get('WSL_DISTRO_NAME', False),
             # 'host': platform.node(),
             # 'version': platform.version(),
         }
@@ -538,29 +629,95 @@ def get_platform():
         return { 'error': e }
 
 
-# check python version
-def check_python(supported_minors=None, experimental_minors=None, reason=None):
-    if experimental_minors is None:
-        experimental_minors = []
-    if supported_minors is None:
-        supported_minors = []
-    if supported_minors is None or len(supported_minors) == 0:
-        supported_minors = [10, 11, 12, 13]
-        experimental_minors = [14]
+@lru_cache
+def get_tools():
+    try:
+        return {
+            'python': check_python(),
+            'git': check_git(),
+            'setuptools': package_version('setuptools'),
+            'pip': package_version('pip'),
+            'uv': check_uv(),
+        }
+    except Exception as e:
+        return { 'error': e }
+
+
+# check uv
+@lru_cache
+def check_uv():
     t_start = time.time()
     if args.quick:
-        return
-    log.info(f'Python: version={platform.python_version()} platform={platform.system()} bin="{sys.executable}" venv="{sys.prefix}"')
+        return None
+    uv_version = package_version('uv')
+    if uv_version is None:
+        uv_cmd = shutil.which('uv')
+        if uv_cmd is not None:
+            result, _ = run([uv_cmd, '--version'], check=True)
+            match = re.match(r'^\s*uv\s+(\d+(?:\.\d+)+(?:[A-Za-z0-9.+-]*))', result.stdout, re.IGNORECASE)
+            if match is not None:
+                uv_version = match.group(1)
+    ts('uv', t_start)
+    return uv_version
+
+
+# check git version
+@lru_cache
+def check_git():
+    t_start = time.time()
+    if args.quick:
+        return None
+    if args.skip_git:
+        return None
+
+    git_cmd = os.environ.get('GIT', "git")
+    git_version = None
+    if shutil.which(git_cmd) is None:
+        log.error('Git: not found')
+        if not args.ignore:
+            sys.exit(1)
+    else:
+        git_version = git('--version', folder=None, ignore=False)
+        git_version = git_version.split()[-1].strip()
+        match = re.match(r'^(\d+)\.(\d+)', git_version)
+        if match is None:
+            log.error(f'Git: unable to parse version="{git_version}" minimum required=2.25')
+            if not args.ignore:
+                sys.exit(1)
+        elif tuple(map(int, match.groups())) < (2, 25):
+            log.error(f'Git: version={git_version} minimum required=2.25')
+            if not args.ignore:
+                sys.exit(1)
+        # log.debug(f'Git: version={git_version}')
+    ts('git', t_start)
+    return git_version
+
+
+# check python version
+@lru_cache
+def check_python(supported_minors=None, experimental_minors=None, reason=None):
+    if experimental_minors is None:
+        experimental_minors = ()
+    if supported_minors is None:
+        supported_minors = ()
+    if supported_minors is None or len(supported_minors) == 0:
+        supported_minors = (10, 11, 12, 13)
+        experimental_minors = (14,)
+    t_start = time.time()
+    ver = platform.python_version()
+    log.info(f'Environment: python={ver} platform={platform.system()} bin="{sys.executable}" venv="{sys.prefix}"')
+    if args.quick:
+        return ver
     if sys.prefix == getattr(sys, "base_prefix", sys.prefix) and 'venv' not in sys.prefix.lower():
         log.warning('Python: virtual environment not detected')
     if int(sys.version_info.minor) == 9:
-        log.error(f"Python: version={platform.python_version()} is end-of-life")
+        log.error(f"Python: version={ver} is end-of-life")
     if int(sys.version_info.minor) == 10:
-        log.warning(f"Python: version={platform.python_version()} is not actively supported")
+        log.warning(f"Python: version={ver} is not actively supported")
     if int(sys.version_info.minor) >= 12:
         os.environ.setdefault('SETUPTOOLS_USE_DISTUTILS', 'local') # hack for python 3.11 setuptools
     if int(sys.version_info.minor) >= 13:
-        # log.warning(f"Python: version={platform.python_version()} not all features are available")
+        # log.warning(f"Python: version={ver} not all features are available")
         pass
 
     if (int(sys.version_info.major) == 3 and int(sys.version_info.minor) in supported_minors):
@@ -579,18 +736,10 @@ def check_python(supported_minors=None, experimental_minors=None, reason=None):
             log.warning(f"Python: {reason}")
         sys.exit(1)
 
-    if not args.skip_git:
-        git_cmd = os.environ.get('GIT', "git")
-        if shutil.which(git_cmd) is None:
-            log.error('Git not found')
-            if not args.ignore:
-                sys.exit(1)
-    else:
-        git_version = git('--version', folder=None, ignore=False)
-        log.debug(f'Git: version={git_version.replace("git version", "").strip()}')
     if ' ' in sys.executable:
         log.warning(f'Python: path="{sys.executable}" contains spaces which may cause issues')
     ts('python', t_start)
+    return ver
 
 
 # register sdnq package from github submodule
@@ -635,10 +784,10 @@ def check_diffusers():
             log.info(f'Install: package="diffusers" commit={diffusers_target}')
         else:
             log.info(f'Update: package="diffusers" current={pkg.version} commit={diffusers_commit} target={diffusers_target}')
-            pip('uninstall --yes diffusers', ignore=True, quiet=True, uv=False)
+            uninstall('diffusers', quiet=True)
         if args.skip_git:
             log.warning('Git: marked as not available but required for diffusers installation')
-        pip(f'install git+https://github.com/huggingface/diffusers@{diffusers_target}', ignore=False, quiet=True, uv=False)
+        pip(f'install git+https://github.com/huggingface/diffusers@{diffusers_target}', ignore=False, quiet=True)
         diffusers_commit = diffusers_target
     ts('diffusers', t_start)
 
@@ -659,7 +808,7 @@ def check_transformers():
             log.info(f'Install: package="transformers" commit={transformers_target}')
         else:
             log.info(f'Update: package="transformers" current={pkg_transformers.version} commit={transformers_commit} target={transformers_target}')
-        pip('uninstall --yes transformers', ignore=True, quiet=True)
+        uninstall('transformers', quiet=True)
         pip(f'install tokenizers=={target_tokenizers}', ignore=False, quiet=True)
         pip(f'install git+https://github.com/huggingface/transformers@{transformers_target}', ignore=False, quiet=True)
         transformers_commit = transformers_target
@@ -679,7 +828,12 @@ def check_onnx():
         install(os.environ.get('ONNXRUNTIME_COMMAND', 'onnxruntime'), ignore=True)
     else:
         onnx_version = package_version('onnxruntime') or ''
-        if onnx_version.startswith('1.1'):
+        try:
+            from packaging.version import InvalidVersion, Version
+            update_onnxruntime = Version(onnx_version) < Version('1.30.0')
+        except InvalidVersion:
+            update_onnxruntime = False
+        if update_onnxruntime:
             log.warning(f'ONNX: onnxruntime={onnx_version} upgrade required')
             uninstall('onnxruntime', quiet=True)
             install(os.environ.get('ONNXRUNTIME_COMMAND', 'onnxruntime'), ignore=True)
@@ -713,7 +867,7 @@ def install_cuda():
     if args.use_nightly:
         cmd = os.environ.get('TORCH_COMMAND', '--upgrade --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu132 --extra-index-url https://download.pytorch.org/whl/nightly/cu130')
     else:
-        cmd = os.environ.get('TORCH_COMMAND', 'torch==2.14.1+cu132 torchvision==0.29.1+cu132 --index-url https://download.pytorch.org/whl/cu132')
+        cmd = os.environ.get('TORCH_COMMAND', 'torch==2.15.0+cu132 torchvision==0.29.2+cu132 --index-url https://download.pytorch.org/whl/cu132')
     return cmd
 
 
@@ -748,11 +902,13 @@ def install_rocm():
             if device_id < len(amd_gpus):
                 device = amd_gpus[device_id]
 
-    rocm_sdk_version = '10.1.0' if device is not None and device.gfx_version >= 0x1100 else '10.0.0'
+    """
+    # disable explicit rocm installation
     if sys.platform == "win32" and (not args.use_zluda) and (device is not None) and (device.therock is not None) and not installed("rocm"):
-        check_python(supported_minors=[11, 12, 13], reason='ROCm-Windows: python==3.11/3.12/3.13 required')
-        install(f"rocm[devel,libraries]=={rocm_sdk_version} --index-url https://stable.repo.amd.com/rocm/whl-next/")
+        check_python(supported_minors=(11, 12, 13), reason='ROCm-Windows: python==3.11/3.12/3.13 required')
+        install(f"rocm==10.0.0 rocm-sdk-core rocm-sdk-devel rocm-sdk-libraries rocm-sdk-device-{device.therock} --index-url https://stable.repo.amd.com/rocm/whl-next/")
         rocm.refresh()
+    """
 
     msg = f'ROCm: version={rocm.version}'
     if device is not None:
@@ -784,19 +940,13 @@ def install_rocm():
         else:
             if device is None:
                 log.error('ROCm: no agent found - make sure that graphics driver is installed and up to date')
-            if device is not None and device.therock is not None:
-                check_python(supported_minors=[11, 12, 13], reason='ROCm-Windows: python==3.11/3.12/3.13 required')
-                # Use device-specific index for torch/torchvision, with root index as fallback for torchaudio and other packages
-                if rocm_sdk_version == '10.0.0':
-                    # The unpinned index resolves to ROCm 10.1 wheels, which are incompatible with gfx10 GPUs.
-                    torch_command = os.environ.get('TORCH_COMMAND', f'"torch[device-{device.therock}]==2.13.0+rocm10.0.0" "torchvision[device-{device.therock}]==0.28.0+rocm10.0.0" "torchaudio==2.11.0+rocm10.0.0" --index-url https://stable.repo.amd.com/rocm/whl-next/')
-                else:
-                    torch_command = os.environ.get('TORCH_COMMAND', f'"torch[device-{device.therock}]" "torchvision[device-{device.therock}]==0.29.0a0+rocm10.1.0" torchaudio --index-url https://stable.repo.amd.com/rocm/whl-next/')
-            elif isinstance(rocm.environment, rocm.PythonPackageEnvironment):
-                check_python(supported_minors=[11, 12, 13], reason='ROCm-Windows: python==3.11/3.12/3.13 required')
-                torch_command = os.environ.get('TORCH_COMMAND', 'torch torchvision torchaudio --index-url https://stable.repo.amd.com/rocm/whl-next/')
+            elif device.therock is not None and args.use_nightly:
+                torch_command = os.environ.get('TORCH_COMMAND', f'"torch[device-{device.therock}]" "torchvision[{device.therock}]" "torchaudio" -U --index-url https://nightly.repo.amd.com/rocm/whl-next/')
+            elif device.therock is not None:
+                check_python(supported_minors=(11, 12, 13), reason='ROCm-Windows: python==3.11/3.12/3.13 required')
+                torch_command = os.environ.get('TORCH_COMMAND', f'"torch[device-{device.therock}]==2.14.0+rocm10.1.0" "torchvision[{device.therock}]==0.29.0a0+rocm10.1.0" "torchaudio==2.11.0.3+rocm10.1.0" -U --index-url https://stable.repo.amd.com/rocm/whl-next/ --extra-index-url https://stable.repo.amd.com/rocm/pytorch/whl-next/')
             else:
-                check_python(supported_minors=[12], reason='ROCm-Windows: python==3.12 required')
+                check_python(supported_minors=(12,), reason='ROCm-Windows: python==3.12 required')
                 # torch 2.8.0a0 is the last version with rocm 6.4 support
                 torch_command = os.environ.get('TORCH_COMMAND', '--no-cache-dir https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/torch-2.8.0a0%2Bgitfc14c65-cp312-cp312-win_amd64.whl https://repo.radeon.com/rocm/windows/rocm-rel-6.4.4/torchvision-0.24.0a0%2Bc85f008-cp312-cp312-win_amd64.whl')
 
@@ -805,13 +955,15 @@ def install_rocm():
         if args.use_nightly:
             torch_command = os.environ.get('TORCH_COMMAND', '--upgrade --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/rocm10.1')
         else:
-            if (rocm.version is None) or (rocm_major > 7): # assume the latest if version check fails
-                torch_command = os.environ.get('TORCH_COMMAND', 'torch==2.14.1+rocm7.14 torchvision==0.29.1+rocm7.14 --index-url https://download.pytorch.org/whl/rocm7.14')
+            if (rocm.version is None) or (rocm_major > 10): # assume the latest if version check fails
+                torch_command = os.environ.get('TORCH_COMMAND', 'torch==2.15.0+rocm10.0 torchvision==0.29.2+rocm10.0 --index-url https://download.pytorch.org/whl/rocm10.0')
             else:
                 match rocm_major:
+                    case 10: # amd skipped from 7 to 10
+                        torch_command = os.environ.get('TORCH_COMMAND', 'torch==2.15.0+rocm10.0 torchvision==0.29.2+rocm10.0 --index-url https://download.pytorch.org/whl/rocm10.0')
                     case 7:
-                        if rocm_minor >= 2: # latest supported rocm 7.x
-                            torch_command = os.environ.get('TORCH_COMMAND', 'torch==2.14.1+rocm7.14 torchvision==0.29.1+rocm7.14 --index-url https://download.pytorch.org/whl/rocm7.14')
+                        if rocm_minor > 2: # amd skipped from 7.2 to 7.14
+                            torch_command = os.environ.get('TORCH_COMMAND', 'torch==2.15.0+rocm7.14 torchvision==0.29.2+rocm7.14 --index-url https://download.pytorch.org/whl/rocm7.14')
                         else:
                             match rocm_minor:
                                 case 2:
@@ -898,8 +1050,6 @@ def install_torch_addons():
         install('DeepCache')
     if opts.get('cuda_compile_backend', '') == 'olive-ai':
         install('olive-ai')
-    if opts.get('samples_format', 'jpg') == 'jxl' or opts.get('grid_format', 'jpg') == 'jxl':
-        install('pillow-jxl-plugin==1.3.7', 'pillow-jxl-plugin')
     if not args.experimental:
         uninstall('wandb', quiet=True)
         uninstall('pynvml', quiet=True)
@@ -1176,7 +1326,7 @@ def run_extension_installer(folder):
             if os.environ.get('PYTHONPATH', None) is not None:
                 separator = ';' if sys.platform == 'win32' else ':'
                 env['PYTHONPATH'] += separator + os.environ.get('PYTHONPATH', None)
-            result, txt = run(sys.executable, path_installer, env=env, cwd=folder)
+            result, txt = run([sys.executable, path_installer], env=env, cwd=folder)
             debug(f'Extension installer: file="{path_installer}" {result.stdout}')
             if result.returncode != 0:
                 errors.append(f'ext: {os.path.basename(folder)}')
@@ -1288,8 +1438,8 @@ def install_submodules(force=True):
         txt = git('submodule')
         git_reset()
         log.info('Continuing setup')
-    git('submodule --quiet update --init --recursive')
     git('submodule --quiet sync --recursive')
+    git('submodule --quiet update --init --recursive')
     submodules = txt.splitlines()
     res = []
     for submodule in submodules:
@@ -1382,7 +1532,6 @@ def install_optional():
     install('addict')
     install('yapf')
     install('--no-build-isolation git+https://github.com/Disty0/BasicSR@23c1fb6f5c559ef5ce7ad657f2fa56e41b121754', 'basicsr', ignore=True, quiet=True)
-    install('av', ignore=True, quiet=True)
     install('beautifulsoup4', ignore=True, quiet=True)
     install('clean-fid', ignore=True, quiet=True)
     install('clip_interrogator==0.6.0', ignore=True, quiet=True)
@@ -1391,7 +1540,7 @@ def install_optional():
     install('hf_transfer', ignore=True, quiet=True)
     install('nvidia-ml-py', ignore=True, quiet=True)
     install('pillow-heif')
-    install('pillow-jxl-plugin==1.3.7', ignore=True, quiet=True)
+    install('pillow-jxl-plugin==1.3.8', ignore=True, quiet=True)
     install('ultralytics==8.4.67', ignore=True, quiet=True)
     install('open-clip-torch', no_deps=True, quiet=True)
     install('runai_model_streamer', ignore=True, quiet=True)
@@ -1441,7 +1590,6 @@ def install_requirements():
 
 # set environment variables controlling the behavior of various libraries
 def set_environment():
-
     log.debug('Setting environment tuning')
     from modules.logger import console
     log.debug(f'Console: terminal={console.is_terminal} width={console.width} height={console.height} color={console.color_system} legacy={console.legacy_windows}')
@@ -1461,7 +1609,6 @@ def set_environment():
     os.environ.setdefault('KINETO_LOG_LEVEL', '3')
     os.environ.setdefault('NEOReadDebugKeys', '1')
     os.environ.setdefault('NUMEXPR_MAX_THREADS', '16')
-    os.environ.setdefault('PYTHONHTTPSVERIFY', '0')
     os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
     os.environ.setdefault('PYTORCH_ENABLE_XPU_FALLBACK', '1')
     os.environ.setdefault('RUNAI_STREAMER_CHUNK_BYTESIZE', '2097152')
@@ -1474,6 +1621,7 @@ def set_environment():
     os.environ.setdefault('TOKENIZERS_PARALLELISM', '0')
     os.environ.setdefault('TORCH_CUDNN_V8_API_ENABLED', '1')
     os.environ.setdefault('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
+    os.environ.setdefault('TRITON_DEFAULT_FP_FUSION', '1')
     os.environ.setdefault('MIOPEN_FIND_MODE', '2')
     os.environ.setdefault('UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS', '1')
     os.environ.setdefault('USE_TORCH', '1')
@@ -1489,11 +1637,12 @@ def set_environment():
     os.environ.setdefault('HF_HUB_VERBOSITY', 'warning')
     os.environ.setdefault('HF_HUB_DOWNLOAD_TIMEOUT', '60')
     os.environ.setdefault('HF_HUB_ETAG_TIMEOUT', '10')
-    allocator = f'garbage_collection_threshold:{opts.get("torch_gc_threshold", 80)/100:0.2f},max_split_size_mb:512'
+    if opts.get("torch_expandable_segments", False):
+        allocator = 'expandable_segments:True' # with the gc threshold and max split size added, large VAE decodes fail with out-of-memory and then a caching allocator assert
+    else:
+        allocator = f'garbage_collection_threshold:{opts.get("torch_gc_threshold", 80)/100:0.2f},max_split_size_mb:512'
     if opts.get("torch_malloc", "native") == 'cudaMallocAsync':
         allocator += ',backend:cudaMallocAsync'
-    if opts.get("torch_expandable_segments", False):
-        allocator += ',expandable_segments:True'
     os.environ.setdefault('PYTORCH_ALLOC_CONF', allocator)
     os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', allocator)
     os.environ.setdefault('PYTORCH_HIP_ALLOC_CONF', allocator)
@@ -1565,8 +1714,7 @@ def get_version(force=False):
 
         try:
             if os.path.exists('extensions-builtin/sdnext-modernui'):
-                branch_ui = run('git', 'rev-parse --abbrev-ref HEAD', check=True, cwd='extensions-builtin/sdnext-modernui')[0].stdout.strip()
-                commit_ui = run('git', 'rev-parse HEAD', check=True, cwd='extensions-builtin/sdnext-modernui')[0].stdout.strip()
+                branch_ui, commit_ui = git_branch_commit('extensions-builtin/sdnext-modernui')
                 version['ui'] = ('dev' if 'dev' in branch_ui else 'main') + '@' + commit_ui[:8]
             else:
                 version['ui'] = 'unavailable'
@@ -1578,8 +1726,7 @@ def get_version(force=False):
             if os.environ.get('SD_KANVAS_DISABLE', None) is not None:
                 version['kanvas'] = 'disabled'
             elif os.path.exists('extensions-builtin/sdnext-kanvas'):
-                branch_kanvas = run('git', 'rev-parse --abbrev-ref HEAD', check=True, cwd='extensions-builtin/sdnext-kanvas')[0].stdout.strip()
-                commit_kanvas = run('git', 'rev-parse HEAD', check=True, cwd='extensions-builtin/sdnext-kanvas')[0].stdout.strip()
+                branch_kanvas, commit_kanvas = git_branch_commit('extensions-builtin/sdnext-kanvas')
                 version['kanvas'] = ('dev' if 'dev' in branch_kanvas else 'main') + '@' + commit_kanvas[:8]
             else:
                 version['kanvas'] = 'unavailable'
@@ -1589,8 +1736,7 @@ def get_version(force=False):
 
         try:
             if os.path.exists('extensions-builtin/sdnq'):
-                branch_sdnq = run('git', 'rev-parse --abbrev-ref HEAD', check=True, cwd='extensions-builtin/sdnq')[0].stdout.strip()
-                commit_sdnq = run('git', 'rev-parse HEAD', check=True, cwd='extensions-builtin/sdnq')[0].stdout.strip()
+                branch_sdnq, commit_sdnq = git_branch_commit('extensions-builtin/sdnq')
                 version['sdnq'] = ('dev' if 'dev' in branch_sdnq else 'main') + '@' + commit_sdnq[:8]
             else:
                 version['sdnq'] = 'unavailable'
@@ -1734,7 +1880,7 @@ def check_version(reset=True): # pylint: disable=unused-argument
             log.error(f'Repository: branches API returned {branches!r} from {api_base}')
             return
         branch_names = [b['name'] for b in branches if 'name' in b]
-        log.trace(f'Repository branches: active={branch_name} available={branch_names}')
+        debug(f'Branch: active={branch_name} available={branch_names}')
     except Exception as e:
         log.error(f'Repository: failed to get branches: {e}')
         return
@@ -1986,7 +2132,7 @@ def ensure_base_requirements():
         global setuptools, distutils # pylint: disable=global-statement
         # python may ship with incompatible setuptools
         if args.uv:
-            subprocess.run(f'uv pip install setuptools=={setuptools_version} wheel', shell=True, check=False, env=os.environ, capture_output=True)
+            subprocess.run(f'uv pip install setuptools=={setuptools_version} wheel --python "{sys.executable}"', shell=True, check=False, env=os.environ, capture_output=True)
         else:
             subprocess.run(f'"{sys.executable}" -m pip install setuptools=={setuptools_version} wheel', shell=True, check=False, env=os.environ, capture_output=True)
         # need to delete all references to modules to be able to reload them otherwise python will use cached version

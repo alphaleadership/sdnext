@@ -4,6 +4,7 @@ wheel
 
 # standard
 anyio
+av
 filetype
 future
 GitPython
@@ -25,14 +26,14 @@ fastapi==0.124.4
 uvicorn==0.52.4
 rich==15.0.0
 safetensors==0.8.0
-peft==0.21.2
+peft==0.21.3
 httpx==0.28.1
 requests==2.34.2
 tqdm==4.70.1
 accelerate==1.15.0
 einops==0.8.2
-huggingface_hub==2.3.0
-hf_xet==1.7.0
+huggingface_hub==2.4.0
+hf_xet==1.8.0
 pandas==2.3.1
 protobuf==7.36.2
 pytorch_lightning==2.6.6
@@ -44,6 +45,9 @@ typing-extensions==4.16.0
 sentencepiece==0.2.2
 
 # lint
+ty
 ruff
 pylint
+pyright
 pre-commit
+codespell

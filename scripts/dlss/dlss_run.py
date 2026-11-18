@@ -45,6 +45,75 @@ def _to_ndarray_rgb_float(img) -> np.ndarray:
     return arr.astype(np.float32) / 255.0
 
 
+def get(kwargs, name, default):
+    value = kwargs.get(name)
+    return default if value is None else value
+
+
+def resolve_video_options(codec: str | None, ext: str | None, pix: str | None, opt: str | None) -> tuple[str, str, str | None, str]:
+    """The UI's video defaults for any control a caller left unset; API and Enso jobs pass None for controls they lack.
+
+    An unset pixel format stays None and the writer takes the codec's table value."""
+    from modules.video_models import video_codecs
+    codec = 'libx264' if codec is None else codec
+    ext = (video_codecs.get_codec_ext(codec) or 'mp4') if ext is None else ext
+    opt = video_codecs.get_codec_options(codec) if opt is None else opt
+    return codec, ext, pix, opt
+
+
+def probe_video_audio(filepath: str) -> tuple[int | None, str]:
+    from modules.video_models.video_utils import check_av
+    av = check_av()
+    if av is None:
+        return None, 'stereo'
+    try:
+        with av.open(filepath) as container:
+            if not container.streams.audio:
+                return None, 'stereo'
+            stream = container.streams.audio[0]
+            sample_rate = stream.codec_context.sample_rate
+            if not sample_rate:
+                raise ValueError('input audio stream has no sample rate')
+            layout = stream.layout.name if stream.layout is not None else 'stereo'
+            return int(sample_rate), layout
+    except Exception as e:
+        log.error(f'DLSS audio: file="{filepath}" probe failed: {e}')
+        return None, 'stereo'
+
+
+def write_video_audio(filepath: str, writer) -> bool:
+    from modules.video_models.video_utils import check_av
+    av = check_av()
+    if av is None:
+        return False
+    try:
+        with av.open(filepath) as container:
+            if not container.streams.audio:
+                log.error(f'DLSS audio: file="{filepath}" source audio stream is missing')
+                return False
+            stream = container.streams.audio[0]
+            sample_rate = stream.codec_context.sample_rate
+            layout = stream.layout.name if stream.layout is not None else 'stereo'
+            writer.write_audio({'sr': sample_rate, 'layout': layout, 'frames': container.decode(stream)}, sample_rate)
+        return True
+    except Exception as e:
+        log.error(f'DLSS audio: file="{filepath}" mux failed: {e}')
+        return False
+
+
+def dlss_output_fps(fps_in: float, framegen_factor: int, fg_mode: str) -> float:
+    """Output frame rate: FrameGen in fps mode multiplies the input rate, slow motion keeps it so the clip plays longer."""
+    if framegen_factor > 1 and fg_mode == 'fps':
+        return fps_in * framegen_factor
+    return fps_in
+
+
+def set_video_framegen_factor(p: StableDiffusionProcessing | None, framegen_factor: int, fg_mode: str = 'fps') -> None:
+    """Pass the active FrameGen output-rate multiplier to the Video tab encoder."""
+    if hasattr(p, 'video_framegen_factor'):
+        p.video_framegen_factor = framegen_factor if fg_mode == 'fps' else 1
+
+
 def dlss_run(p: StableDiffusionProcessing | None,
              pp: Processed | PostprocessedImage,
              *args,
@@ -61,41 +130,42 @@ def dlss_run(p: StableDiffusionProcessing | None,
     elif len(args) > 0: # called with positional arguments from generate / pp=Processed
         dlss_enabled, dlss_graph, dlss_chunk, dlss_full, nr_profile, nr_motion, nr_scale, nr_intensity, nr_blend, nr_detail, nr_colour, nr_radius, nr_threshold, nr_normalized, nr_local_tone, nr_local_structure, nr_skin_structure, nr_mask_structure, ss_profile, ss_scale, ss_detail, ss_colour, ss_radius, ss_threshold, fg_profile, fg_mode, fg_factor, fg_threshold, mp4_codec, mp4_ext, mp4_pix, mp4_opt = args
     elif len(kwargs) > 0: # called with keyword arguments from postprocess / pp=PostprocessedImage
-        dlss_enabled = kwargs.get("dlss_enabled", [])
-        dlss_graph = kwargs.get("dlss_graph", False)
-        dlss_chunk = kwargs.get("dlss_chunk", 131072)
-        dlss_full = kwargs.get("dlss_full", False)
-        nr_profile = kwargs.get("nr_profile", "None")
-        nr_motion = kwargs.get("nr_motion", "flow")
-        nr_scale = kwargs.get("nr_scale", 1.0)
-        nr_intensity = kwargs.get("nr_intensity", 1.0)
-        nr_blend = kwargs.get("nr_blend", 0.73974609375)
-        nr_detail = kwargs.get("nr_detail", 1.0)
-        nr_colour = kwargs.get("nr_colour", 1.0)
-        nr_radius = kwargs.get("nr_radius", 4.0)
-        nr_threshold = kwargs.get("nr_threshold", 0.3)
-        nr_normalized = kwargs.get("nr_normalized", 0.0)
-        nr_local_tone = kwargs.get("nr_local_tone", 1.0)
-        nr_local_structure = kwargs.get("nr_local_structure", 1.0)
-        nr_skin_structure = kwargs.get("nr_skin_structure", 0.0)
-        nr_mask_structure = kwargs.get("nr_mask_structure", 0.0)
-        ss_profile = kwargs.get("ss_profile", "None")
-        ss_scale = kwargs.get("ss_scale", 2.0)
-        ss_detail = kwargs.get("ss_detail", 1.0)
-        ss_colour = kwargs.get("ss_colour", 1.0)
-        ss_radius = kwargs.get("ss_radius", 4.0)
-        ss_threshold = kwargs.get("ss_threshold", 0.4)
-        fg_profile = kwargs.get("fg_profile", "None")
-        fg_mode = kwargs.get("fg_mode", "fps")
-        fg_factor = kwargs.get("fg_factor", 2)
-        fg_threshold = kwargs.get("fg_threshold", 0.4)
-        mp4_codec = kwargs.get("mp4_codec", "libx264")
-        mp4_ext = kwargs.get("mp4_ext", "mp4")
-        mp4_pix = kwargs.get("mp4_pix", "yuv420p")
-        mp4_opt = kwargs.get("mp4_opt", "")
+        dlss_enabled = get(kwargs, "dlss_enabled", [])
+        dlss_graph = get(kwargs, "dlss_graph", False)
+        dlss_chunk = get(kwargs, "dlss_chunk", 131072)
+        dlss_full = get(kwargs, "dlss_full", False)
+        nr_profile = get(kwargs, "nr_profile", "None")
+        nr_motion = get(kwargs, "nr_motion", "Medium")
+        nr_scale = get(kwargs, "nr_scale", 1.0)
+        nr_intensity = get(kwargs, "nr_intensity", 1.0)
+        nr_blend = get(kwargs, "nr_blend", 0.73974609375)
+        nr_detail = get(kwargs, "nr_detail", 1.0)
+        nr_colour = get(kwargs, "nr_colour", 1.0)
+        nr_radius = get(kwargs, "nr_radius", 4.0)
+        nr_threshold = get(kwargs, "nr_threshold", 0.3)
+        nr_normalized = get(kwargs, "nr_normalized", 0.0)
+        nr_local_tone = get(kwargs, "nr_local_tone", 1.0)
+        nr_local_structure = get(kwargs, "nr_local_structure", 1.0)
+        nr_skin_structure = get(kwargs, "nr_skin_structure", 0.0)
+        nr_mask_structure = get(kwargs, "nr_mask_structure", 0.0)
+        ss_profile = get(kwargs, "ss_profile", "None")
+        ss_scale = get(kwargs, "ss_scale", 2.0)
+        ss_detail = get(kwargs, "ss_detail", 1.0)
+        ss_colour = get(kwargs, "ss_colour", 1.0)
+        ss_radius = get(kwargs, "ss_radius", 4.0)
+        ss_threshold = get(kwargs, "ss_threshold", 0.4)
+        fg_profile = get(kwargs, "fg_profile", "None")
+        fg_mode = get(kwargs, "fg_mode", "fps")
+        fg_factor = get(kwargs, "fg_factor", 2)
+        fg_threshold = get(kwargs, "fg_threshold", 0.4)
+        mp4_codec = get(kwargs, "mp4_codec", None)
+        mp4_ext = get(kwargs, "mp4_ext", None)
+        mp4_pix = get(kwargs, "mp4_pix", None)
+        mp4_opt = get(kwargs, "mp4_opt", None)
     else:
         log.warning('DLSS run called with unexpected argument structure')
         return None
+    mp4_codec, mp4_ext, mp4_pix, mp4_opt = resolve_video_options(mp4_codec, mp4_ext, mp4_pix, mp4_opt)
     if p is not None: # override load args from processing object
         if hasattr(p, 'nr_profile'):
             nr_profile = getattr(p, 'nr_profile', nr_profile)
@@ -123,6 +193,8 @@ def dlss_run(p: StableDiffusionProcessing | None,
     has_images = hasattr(pp, "images") and pp.images is not None
     has_image = hasattr(pp, "image") and pp.image is not None
     has_video = hasattr(pp, "video") and pp.video is not None
+    video_input = pp.video if has_video else None
+    audio_rate, audio_layout = probe_video_audio(video_input) if video_input else (None, 'stereo')
     if has_images:
         raw_inputs = pp.images if isinstance(pp.images, list) else [pp.images]
     elif has_image:
@@ -147,6 +219,9 @@ def dlss_run(p: StableDiffusionProcessing | None,
     dtype = torch.float32 if dlss_full else torch.float16
 
     active_pipelines = []
+    jobid = None
+    video_writter = None
+    reader = None
     try:
         t0 = time.perf_counter()
         active_chain = []
@@ -199,6 +274,7 @@ def dlss_run(p: StableDiffusionProcessing | None,
                     if p is not None:
                         p.extra_generation_params['DLSSFG'] = f'{fg_opt_profile}'
                     active_chain.append(('fg', fg_session))
+                    set_video_framegen_factor(p, int(fg_factor), fg_mode)
             elif ('super' in op_lower) or ('vsr' in op_lower) or (op_lower == 's'):
                 ss_model_path = _resolve_model_path(SS_MODEL)
                 if ss_model_path:
@@ -257,7 +333,6 @@ def dlss_run(p: StableDiffusionProcessing | None,
         jobid = shared.state.begin('DLSS')
 
         filename = None
-        video_writter = None
         use_stream = has_video and(len(raw_inputs) > 0) and (raw_inputs[0] is None)
         num_frames = len(raw_inputs)
         framegen_factor = 1
@@ -265,9 +340,11 @@ def dlss_run(p: StableDiffusionProcessing | None,
             if stage_name == 'fg':
                 framegen_factor *= session.options.factor
         output_frames_hint = 1 + (num_frames - 1) * framegen_factor
+        output_fps = dlss_output_fps(fps, framegen_factor, fg_mode) if has_video and fps else None
 
         if use_stream:
-            raw_inputs = video.read_generator(pp.video) # use read generator instead of bulk read
+            reader = video.read_generator(pp.video) # use read generator instead of bulk read
+            raw_inputs = reader
 
         if hasattr(pp, 'video') and isinstance(pp.video, str):
             filename = os.path.splitext(os.path.basename(pp.video))[0]
@@ -295,7 +372,11 @@ def dlss_run(p: StableDiffusionProcessing | None,
                                                                    mp4_codec=mp4_codec,
                                                                    mp4_ext=mp4_ext,
                                                                    mp4_pix=mp4_pix,
-                                                                   mp4_opt=mp4_opt)
+                                                                   mp4_opt=mp4_opt,
+                                                                   source=pp.video,
+                                                                   fps=output_fps,
+                                                                   audio_rate=audio_rate,
+                                                                   audio_layout=audio_layout)
                         video_initialized = True
                     else:
                         video.save_video_frames(video_writter, current_frames)
@@ -311,13 +392,18 @@ def dlss_run(p: StableDiffusionProcessing | None,
             output_images = total_produced_frames
 
         if video_writter is not None:
+            if audio_rate is not None and video_input is not None:
+                if reader is not None:
+                    reader.close()
+                    reader = None
+                write_video_audio(video_input, video_writter)
             video_writter.release()
         elif has_images:
             pp.images = output_images.copy()
         elif has_image:
             pp.image = output_images[0] if output_images else None
         elif has_video:
-            pp.video = video.save_video(p, output_images, video_type='mp4', duration=duration, sync=True, mp4_codec=mp4_codec, mp4_ext=mp4_ext, mp4_pix=mp4_pix, mp4_opt=mp4_opt)
+            pp.video = video.save_video(p, output_images, video_type='mp4', duration=duration, sync=True, mp4_codec=mp4_codec, mp4_ext=mp4_ext, mp4_pix=mp4_pix, mp4_opt=mp4_opt, source=pp.video, fps=output_fps)
 
         t2 = time.perf_counter()
         log.debug(f'DLSS output: frames={len(output_images)} init={t1 - t0:.4f} time={t2 - t1:.4f} its={len(output_images) / (t2 - t1):.4f}')
@@ -328,9 +414,17 @@ def dlss_run(p: StableDiffusionProcessing | None,
             log.trace(f'Video info: {video.get_video_info(pp.video)}')
             log.trace(f'Video params: {video.get_video_params(pp.video)}')
             log.trace(f'Video metadata: {video.get_video_metadata(pp.video)}')
-        shared.state.end(jobid)
 
     finally:
+        if reader is not None:
+            reader.close() # the input stays open until then, and Windows refuses to rename or remove an open file
+        if video_writter is not None:
+            try:
+                video_writter.release() # no-op after a normal finish; closes the file when processing raised
+            except Exception as e:
+                log.warning(f'DLSS: video writer release: {e}')
+        if jobid is not None:
+            shared.state.end(jobid)
         for pipe in active_pipelines:
             try:
                 pipe.device = devices.cpu

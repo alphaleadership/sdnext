@@ -74,7 +74,7 @@ def run_postprocessing(extras_mode,
         info = ''
         processed_images = []
         for image, name, ext in zip(image_data, image_names, image_ext, strict=False): # pylint: disable=redefined-argument-from-local
-            log.debug(f'Process: image={image} {args}')
+            log.debug(f'Process: image={image}')
             info = ''
             if shared.state.interrupted:
                 log.debug('Postprocess interrupted')
@@ -88,7 +88,7 @@ def run_postprocessing(extras_mode,
             if image is None:
                 continue
             shared.state.textinfo = name
-            pp = scripts_postprocessing.PostprocessedImage(image.convert("RGB"))
+            pp = scripts_postprocessing.PostprocessedImage(image.convert("RGB"), output_dir=outpath, source_path=name, save_output=save_output)
             scripts_manager.scripts_postproc.run(pp, args)
             geninfo, items = images.read_info_from_image(image)
             params = infotext.parse(geninfo)
@@ -103,7 +103,7 @@ def run_postprocessing(extras_mode,
             info = info + ", ".join([k if k == v else f'{k}: {infotext.quote(v)}' for k, v in pp.info.items() if v is not None])
             pp.image.info["postprocessing"] = info
             processed_images.append(pp.image)
-            if save_output:
+            if save_output and getattr(pp, 'save_output', True):
                 if opts.use_original_name_batch and name is not None:
                     forced_filename = os.path.splitext(os.path.basename(name))[0]
                     images.save_image(pp.image, path=outpath, extension=ext or opts.samples_format, info=info, grid=False, pnginfo_section_name="extras", existing_info=pp.image.info, forced_filename=forced_filename)
@@ -116,11 +116,10 @@ def run_postprocessing(extras_mode,
         return outputs, info, params
 
     def process_video():
-        outputs = []
         params = {}
         if not video or not isinstance(video, str) or not os.path.isfile(video):
             log.error(f'Process: mode=video file="{video}" not found')
-            return outputs, video, '', params
+            return None, f'video file not found: {video}', params
         log.debug(f'Process: video={video} {args}')
         shared.state.textinfo = video
         pp = scripts_postprocessing.PostprocessedImage(video=video)

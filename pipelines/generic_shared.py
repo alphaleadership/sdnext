@@ -52,7 +52,7 @@ shared_te_map = {
     },
     'Qwen-3 9B Base': {
         'cls': transformers.Qwen3ForCausalLM,
-        'identifier': '9b',
+        'identifier': ['9b', 'bluepixel'],
         'target_repo': 'black-forest-labs/FLUX.2-klein-9B',
         'target_subfolder': 'text_encoder',
     },
@@ -118,6 +118,12 @@ shared_te_map = {
         'target_repo': 'Qwen/Qwen3-VL-8B-Instruct',
     },
 
+    'Qwen3-VL 32B Conditional Image SDNQ-UInt4': {
+        'cls': transformers.Qwen3VLForConditionalGeneration,
+        'target_repo': 'SD-Next/MiniMax-H3-Image-SDNQ-uint4-svd-hadamard-dynamic',
+        'identifier': ['MiniMax-H3-Image-SDNQ'],
+        'target_subfolder': 'text_encoder',
+    },
     'Qwen3-VL 32B Conditional': {
         'cls': transformers.Qwen3VLForConditionalGeneration,
         'target_repo': 'MiniMaxAI/MiniMax-H3',
@@ -133,19 +139,19 @@ shared_te_map = {
 
     'Qwen3-VL 8B Conditional Qwen-Image SDNQ-UInt4': {
         'cls': transformers.Qwen3VLForConditionalGeneration,
-        'identifier': ['qwen_image_2_1_sdnq_dynamic_4bit'],
+        'identifier': ['qwen_image_2_1_sdnq_dynamic_4bit', 'qwen_image_2_1_turbo_sdnq_dynamic_4bit'],
         'target_repo': 'OzzyGT/Qwen_Image_2_1_sdnq_dynamic_4bit',
         'target_subfolder': 'text_encoder',
     },
     'Qwen3-VL 8B Conditional Qwen-Image SDNQ-UInt8': {
         'cls': transformers.Qwen3VLForConditionalGeneration,
-        'identifier': ['qwen_image_2_1_sdnq_dynamic_8bit'],
+        'identifier': ['qwen_image_2_1_sdnq_dynamic_8bit', 'qwen_image_2_1_turbo_sdnq_dynamic_8bit'],
         'target_repo': 'OzzyGT/Qwen_Image_2_1_sdnq_dynamic_8bit',
         'target_subfolder': 'text_encoder',
     },
     'Qwen3-VL 8B Conditional Qwen-Image': { # byte-identical to the base instruct checkpoint
         'cls': transformers.Qwen3VLForConditionalGeneration,
-        'identifier': ['qwen-image-2.1'],
+        'identifier': ['qwen-image-2.1', 'qwen_image_2.1'],
         'target_repo': 'Qwen/Qwen3-VL-8B-Instruct',
     },
 

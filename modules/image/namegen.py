@@ -1,5 +1,6 @@
 import re
 import os
+import sys
 import time
 import unicodedata
 import uuid
@@ -26,58 +27,62 @@ NOTHING = object()
 
 class FilenameGenerator:
     replacements = {
-        'width': lambda self: self.width,
-        'height': lambda self: self.height,
+        'uuid': lambda self: str(uuid.uuid4()),
+        # process info
+        'ops': lambda self: ",".join(list(set(getattr(self.p, 'ops', [])))),
+        # batch info
         'batch_number': lambda self: self.batch_number,
         'iter_number': lambda self: self.iter_number,
         'num': lambda self: NOTHING if self.p.n_iter == 1 and self.p.batch_size == 1 else self.p.iteration * self.p.batch_size + self.p.batch_index + 1,
         'generation_number': lambda self: NOTHING if self.p.n_iter == 1 and self.p.batch_size == 1 else self.p.iteration * self.p.batch_size + self.p.batch_index + 1,
+        # timestamps
         'date': lambda self: dt.datetime.now().strftime('%Y-%m-%d'),
         'datetime': lambda self, *args: self.datetime(*args),  # accepts formats: [datetime], [datetime<Format>], [datetime<Format><Time Zone>]
-        'hasprompt': lambda self, *args: self.hasprompt(*args),  # accepts formats:[hasprompt<prompt1|default><prompt2>..]
-        'hash': lambda self: self.image_hash() if self.image is not None else '',
-        'image_hash': lambda self: self.image_hash() if self.image is not None else '',
         'timestamp': lambda self: getattr(self.p, "job_timestamp", shared.state.job_timestamp),
         'epoch': lambda self: int(time.time()),
         'job_timestamp': lambda self: getattr(self.p, "job_timestamp", shared.state.job_timestamp),
-
+        # model info
         'model': lambda self: shared.sd_model.sd_checkpoint_info.title if shared.sd_loaded and getattr(shared.sd_model, 'sd_checkpoint_info', None) is not None else '',
         'model_shortname': lambda self: shared.sd_model.sd_checkpoint_info.model_name if shared.sd_loaded and getattr(shared.sd_model, 'sd_checkpoint_info', None) is not None else '',
         'model_name': lambda self: shared.sd_model.sd_checkpoint_info.model_name if shared.sd_loaded and getattr(shared.sd_model, 'sd_checkpoint_info', None) is not None else '',
         'model_type': lambda self: shared.sd_model_type if shared.sd_loaded else '',
         'model_hash': lambda self: shared.sd_model.sd_checkpoint_info.shorthash if shared.sd_loaded and getattr(shared.sd_model, 'sd_checkpoint_info', None) is not None else '',
-
+        # network info
         'lora': lambda self: self.p and getattr(self.p, 'extra_generation_params', {}).get('LoRA networks', ''),
-
+        'styles': lambda self: (self.p and ",".join([style for style in self.p.styles if not style == "None"])) or "None",
+        'wildcards': lambda self: (self.p and ",".join([wc for wc in getattr(self.p, 'extra_generation_params', {}).get('Wildcards', '') if not wc == "None"])) or "None",
+        # prompt info
+        'hasprompt': lambda self, *args: self.hasprompt(*args),  # accepts formats:[hasprompt<prompt1|default><prompt2>..]
         'prompt': lambda self: self.prompt_full(),
         'prompt_no_styles': lambda self: self.prompt_no_style(),
         'prompt_words': lambda self: self.prompt_words(),
         'prompt_hash': lambda self: hashlib.sha256(self.prompt.encode()).hexdigest()[0:8],
-
+        # image info
+        'hash': lambda self: self.image_hash() if self.image is not None else '',
+        'image_hash': lambda self: self.image_hash() if self.image is not None else '',
+        # params
+        'width': lambda self: self.width,
+        'height': lambda self: self.height,
         'sampler': lambda self: self.p and self.p.sampler_name,
         'seed': lambda self: (hasattr(self, "seed") and self.seed and str(self.seed)) or '',
         'steps': lambda self: self.p and getattr(self.p, 'steps', 0),
         'cfg': lambda self: self.p and getattr(self.p, 'cfg_scale', 0),
         'pag': lambda self: self.p and getattr(self.p, 'cfg_true', 0),
-        'clip_skip': lambda self: self.p and getattr(self.p, 'clip_skip', 0),
         'denoising': lambda self: self.p and getattr(self.p, 'denoising_strength', 0),
-        'styles': lambda self: (self.p and ", ".join([style for style in self.p.styles if not style == "None"])) or "None",
-        'uuid': lambda self: str(uuid.uuid4()),
     }
     default_time_format = '%Y%m%d%H%M%S'
 
     def __init__(self, p=None, seed:int=-1, prompt:str='', image=None, grid=False, width=None, height=None):
+        if debug:
+            fn = f'{sys._getframe(3).f_code.co_name}:{sys._getframe(2).f_code.co_name}:{sys._getframe(1).f_code.co_name}' # pylint: disable=protected-access
+            debug_log(f'Filename called: {fn}')
         self.p = p
-        if p is None:
-            debug_log('Filename generator init skip')
-            return
-        else:
-            debug_log(f'Filename generator init: seed={seed} prompt="{prompt}"')
+        debug_log(f'Filename generator init: p={p} seed={seed} prompt="{prompt}"')
         if seed is not None and int(seed) > 0:
             self.seed = seed
-        elif p is not None and getattr(p, 'all_seeds', None) is not None and len(p.all_seeds) > 0:
+        elif (p is not None) and getattr(p, 'all_seeds', None) is not None and len(p.all_seeds) > 0:
             self.seed = p.all_seeds[0] if p.all_seeds[0] is not None and int(p.all_seeds[0]) > 0 else 0
-        elif p is not None and getattr(p, 'seeds', None) is not None and len(p.seeds) > 0:
+        elif (p is not None) and getattr(p, 'seeds', None) is not None and len(p.seeds) > 0:
             self.seed = p.seeds[0] if p.seeds[0] is not None and int(p.seeds[0]) > 0 else 0
         else:
             self.seed = p.seed if p is not None and getattr(p, 'seed', 0) > 0 else 0
@@ -88,8 +93,13 @@ class FilenameGenerator:
         if isinstance(self.prompt, list):
             self.prompt = ' '.join(self.prompt)
         self.image = image[0] if isinstance(image, list) and len(image) > 0 else image
-        self.width = width if width is not None else (self.image.width if self.image is not None else (p.width if p is not None else 0))
-        self.height = height if height is not None else (self.image.height if self.image is not None else (p.height if p is not None else 0))
+        image_width = getattr(self.image, 'width', None)
+        image_height = getattr(self.image, 'height', None)
+        image_shape = getattr(self.image, 'shape', None)
+        if image_shape is not None and len(image_shape) >= 2:
+            image_height, image_width = image_shape[:2]
+        self.width = width if width is not None else (image_width if image_width is not None else (p.width if p is not None else 0))
+        self.height = height if height is not None else (image_height if image_height is not None else (p.height if p is not None else 0))
         if not grid:
             self.batch_number = NOTHING if self.p is None or getattr(self.p, 'batch_size', 1) == 1 else (self.p.batch_index + 1 if hasattr(self.p, 'batch_index') else NOTHING)
             self.iter_number = NOTHING if self.p is None or getattr(self.p, 'n_iter', 1) == 1 else (self.p.iteration + 1 if hasattr(self.p, 'iteration') else NOTHING)
@@ -193,8 +203,20 @@ class FilenameGenerator:
         debug_log(f'Prompt sanitize: input="{prompt}" output="{sanitized}"')
         return sanitized
 
-    def sanitize(self, filename):
+    def finalize(self, fn, ext, max_length):
+        counter = 1
+        base_fn = fn
+        while os.path.lexists(fn + ext):
+            fn = f"{base_fn}-{counter}"
+            if len(os.fsencode(fn)) > max_length: # if fn is too long, truncate base_fn
+                base_fn = base_fn[:max_length - len(f"-{counter}")]
+                fn = f"{base_fn}-{counter}"
+            counter += 1
+        return fn + ext
+
+    def sanitize(self, filename, base: str | None = None):
         # starting reference: <https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file>
+        # base is a configured output folder: kept as given, only the path below it is sanitized
         invalid_chars = (
             "#<>\"'`"                         # ASCII quote and backtick
             "’‚‛\u2018\u2019\u201B"           # smart single quotes and variants # noqa: RUF001
@@ -206,26 +228,30 @@ class FilenameGenerator:
         invalid_files = ['CON', 'PRN', 'AUX', 'NUL', 'NULL', 'COM0', 'COM1', 'LPT0', 'LPT1']
         invalid_prefix = ', '
         invalid_suffix = '.,_ '
-        fn, ext = os.path.splitext(unicodedata.normalize('NFKC', filename))
-        fn = fn.strip()
+        prefix = os.path.join(base, '') if base else ''
+        if not filename.startswith(prefix):
+            prefix = ''
+        fn, ext = os.path.splitext(unicodedata.normalize('NFKC', filename[len(prefix):]))
+        # strip ' ', '-' from start/end of filename
+        fn = fn.strip('')
         ext = ext.strip()
+        max_length = max(256 - len(ext), os.statvfs(__file__).f_namemax - 32 if hasattr(os, 'statvfs') else 256 - len(ext))
         parts = Path(fn).parts
         newparts = []
         for i, part in enumerate(parts):
             part = part.translate({ ord(x): '_' for x in invalid_chars })
-            if i > 0 or (len(part) >= 2 and part[1] != invalid_folder): # skip drive, otherwise remove
+            if prefix or i > 0 or (len(part) >= 2 and part[1] != invalid_folder): # skip drive, otherwise remove
                 part = part.translate({ ord(x): '_' for x in invalid_folder })
             part = part.lstrip(invalid_prefix).rstrip(invalid_suffix)
             if part in invalid_files: # reserved names
                 [part := part.replace(word, '_') for word in invalid_files] # pylint: disable=expression-not-assigned
+            if len(os.fsencode(part)) > max_length:
+                part = part[:max_length]
             newparts.append(part)
         fn = str(Path(*newparts))
-        fn = fn.replace('  ', ' ').strip()
-        max_length = max(256 - len(ext), os.statvfs(__file__).f_namemax - 32 if hasattr(os, 'statvfs') else 256 - len(ext))
-        while len(os.path.abspath(fn)) > max_length:
-            fn = fn[:-1]
-        fn += ext
-        debug_log(f'Filename sanitize: input="{filename}" parts={parts} output="{fn}" ext={ext} max={max_length} len={len(fn)}')
+        fn = prefix + fn.replace('  ', ' ').strip().rstrip('-.')
+        fn = self.finalize(fn, ext, max_length)
+        debug_log(f'Filename sanitize: input="{filename}" base="{base}" parts={parts} output="{fn}" ext={ext} max={max_length} len={len(fn)}')
         return fn
 
     def safe_int(self, s):
@@ -238,7 +264,7 @@ class FilenameGenerator:
         global seq # pylint: disable=global-statement
         x = fn
         dirname = os.path.dirname(fn)
-        if seq == 0:
+        if seq == 0: # get initial sequence
             files = os.listdir(dirname) if os.path.exists(dirname) and os.path.isdir(dirname) else []
             files = [f for f in files if os.path.isfile(os.path.join(dirname, f))]
             seq_files = len(files)
@@ -259,14 +285,6 @@ class FilenameGenerator:
 
     def apply(self, x):
         res = ''
-        if debug:
-            for k in self.replacements.keys():
-                try:
-                    fn = self.replacements.get(k, None)
-                    debug_log(f'Namegen: key={k} value={fn(self)}')
-                except Exception as e:
-                    log.error(f'Namegen: key={k} {e}')
-                    errors.display(e, 'namegen')
         for m in re_pattern.finditer(x):
             text, pattern = m.groups()
             debug_log(f'Filename apply: text="{text}" pattern="{pattern}"')
@@ -286,7 +304,7 @@ class FilenameGenerator:
                 _pattern, arg = m.groups()
                 pattern_args.insert(0, arg)
 
-            fun = self.replacements.get(pattern.lower(), None)
+            fun = self.replacements.get(_pattern.lower(), None)
             if fun is not None:
                 try:
                     replacement = fun(self, *pattern_args)
@@ -310,7 +328,7 @@ class FilenameGenerator:
                     res += text + str(replacement).replace('/', '-').replace('\\', '-')
                     continue
                 res += text + f'[{pattern}]' # reinsert unknown pattern
-        return res
+        return res.replace(':', '_') # callers join this to the output folder; on windows a letter and a colon start a drive and os.path.join drops the folder
 
 
 def get_next_sequence_number(path, basename): # pylint: disable=unused-argument

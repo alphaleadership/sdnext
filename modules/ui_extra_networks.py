@@ -592,17 +592,18 @@ class ExtraNetworksPage:
         data = {}
         if shared.cmd_opts.no_metadata:
             return data
+        error = not shared.cmd_opts.test
         if path is not None:
             t0 = time.time()
             fn = os.path.splitext(path)[0] + '.json'
             if not data and os.path.exists(fn):
-                data = shared.readfile(fn, silent=True, as_type="dict")
+                data = shared.readfile(fn, silent=True, error=error, as_type="dict")
             fn = os.path.join(path, 'model_index.json')
             if not data and os.path.exists(fn):
-                data = shared.readfile(fn, silent=True, as_type="dict")
+                data = shared.readfile(fn, silent=True, error=error, as_type="dict")
             fn = os.path.join(path, 'modular_model_index.json')
             if not data and os.path.exists(fn):
-                data = shared.readfile(fn, silent=True, as_type="dict")
+                data = shared.readfile(fn, silent=True, error=error, as_type="dict")
             t1 = time.time()
             self.info_time += t1-t0
         return data
@@ -646,6 +647,8 @@ def register_pages():
     if shared.opts.diffusers_enable_embed:
         from modules.ui_extra_networks_textual_inversion import ExtraNetworksPageTextualInversion
         register_page(ExtraNetworksPageTextualInversion())
+    allowed_dirs.append(os.path.abspath(shared.opts.diffusers_dir))
+    allowed_dirs.append(os.path.abspath(shared.opts.hfcache_dir))
 
 
 def get_pages(title: str | None = None):

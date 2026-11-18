@@ -26,12 +26,14 @@ def task_modular_kwargs(p, model):
     task_args = {}
     p.ops.append('modular')
 
-    processing_helpers.resize_init_images(p)
+    width, height = processing_helpers.resize_init_images(p)
     if model_cls == 'MingImageModularPipeline' and len(getattr(p, 'init_images', [])) > 0:
         p.width = max(16, 16 * ((p.width + 8) // 16))
         p.height = max(16, 16 * ((p.height + 8) // 16))
     task_args['width'] = p.width
     task_args['height'] = p.height
+    if (sd_models.get_max_condition_images(model) > 0) and (len(getattr(p, 'init_images', [])) > 0): # a resized hires pass returns the hires size and leaves p.width and p.height at the base size
+        task_args['width'], task_args['height'] = width, height
     if len(getattr(p, 'init_images', [])) > 0:
         task_args['image'] = p.init_images
         if model_cls != 'MingImageModularPipeline':
@@ -210,6 +212,19 @@ def get_params(model):
         possible = list(signature.parameters)
     possible = [p for p in possible if p not in ['self', 'kwargs', None]]
     return possible
+
+
+def get_guidance_params(model, guidance_name: str = 'Default') -> set[str]:
+    """Guidance parameters that reach the pipeline: guidance_scale, true_cfg_scale, guidance_rescale and negative_prompt among its call
+    parameters, plus on a modular pipeline with a guider the guidance_scale, guidance_rescale, start and stop the chosen guider takes."""
+    from modules import modular
+    params = set(get_params(model)) & {'guidance_scale', 'true_cfg_scale', 'guidance_rescale', 'negative_prompt'}
+    if modular.is_modular(model) and modular.is_guider(model):
+        from modules import modular_guiders
+        guider_cls = modular_guiders.guider_class(model, guidance_name)
+        if guider_cls is not None:
+            params |= set(inspect.signature(guider_cls.__init__).parameters) & {'guidance_scale', 'guidance_rescale', 'start', 'stop'}
+    return params
 
 
 def get_defaults(model, kwargs):
@@ -399,6 +414,9 @@ def set_pipeline_args(p, model, prompts:list, negative_prompts:list, prompts_2:l
                 args[key] = args[key][0] if len(args[key]) > 0 else ''
         if not args.get('negative_prompt', None):
             args.pop('negative_prompt', None) # an empty negative is omitted, the base text encoder warns about one it will not use
+    if any(isinstance(n, str) and n.strip() for n in (negative_prompts or [])) and not any(k.startswith('negative_prompt') for k in args) and not getattr(p, 'negative_warned', False):
+        log.warning(f'Pipeline: cls={model.__class__.__name__} negative prompt ignored, the pipeline takes none')
+        p.negative_warned = True
 
     # set callbacks
     if 'prior_callback_steps' in possible:  # Wuerstchen / Cascade

@@ -1,0 +1,1292 @@
+"""Typed API contracts and session routes for the optional chat feature."""
+
+import json
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from html import escape
+from typing import Any, Literal
+
+from fastapi import File, HTTPException, Query, Response, UploadFile
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field, ValidationError
+
+from modules import progress, shared
+from modules.api import control as api_control
+from modules.chat import artifacts, commands, db
+from modules.logger import log
+
+
+ContextId = Literal['image', 'video', 'process', 'caption']
+ChatCommand = Literal[
+    'context', 'clear', 'set', 'get', 'list', 'params', 'args', 'help', 'opts', 'prompt', 'negative', 'snapshot', 'snap',
+    'generate', 'run', 'start', 'again', 'reprocess', 'schedule', 'cancel', 'abort', 'stop', 'interrupt', 'pause',
+    'resume', 'skip', 'history', 'last', 'details', 'title', 'reset', 'model',
+    'use', 'file', 'image', 'meta', 'exif', 'metadata', 'session', 'import',
+]
+ServerEndpointAlias = Literal[
+    'info', 'ver', 'version', 'gpu', 'smi', 'mem', 'memory', 'status', 'storage',
+]
+OperationStatus = Literal['running', 'completed', 'failed', 'cancelled']
+
+_session_state = {'initialization_failed': False}
+
+
+def is_enabled():
+    return shared.opts.chat_enabled and not _session_state['initialization_failed']
+
+
+class ResChatStatus(BaseModel):
+    available: bool
+
+
+def get_chat_status():
+    return ResChatStatus(available=is_enabled())
+
+
+class ReqSessionCreate(BaseModel):
+    title: str | None = Field(default=None, title='Title')
+    context: ContextId = Field(default='image', title='Context')
+
+
+class ReqSessionUpdate(BaseModel):
+    title: str | None = Field(default=None, title='Title')
+    context: ContextId | None = Field(default=None, title='Context')
+    drafts: dict[str, dict[str, Any]] | None = Field(default=None, title='Context drafts')
+    last_generation_prompt: str | None = Field(default=None, title='Last generation prompt')
+    last_generation_snapshot: dict[str, Any] | None = Field(default=None, title='Last generation snapshot')
+    selected_image_id: str | None = Field(default=None, title='Selected image artifact')
+    selected_image_ids: list[str] | None = Field(default=None, title='Selected image artifacts')
+
+
+class ResSession(BaseModel):
+    id: str
+    title: str
+    context: ContextId
+    drafts: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    last_generation_prompt: str | None = None
+    last_generation_snapshot: dict[str, Any] | None = None
+    selected_image_id: str | None = None
+    selected_image_ids: list[str] = Field(default_factory=list)
+    created_at: str
+    updated_at: str
+
+
+class ResMessage(BaseModel):
+    id: str
+    role: Literal['system', 'user', 'assistant']
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_at: str
+
+
+class ResChatArtifact(BaseModel):
+    id: str
+    message_id: str | None = None
+    media_type: str
+    display_name: str
+    role: Literal['input', 'result']
+    source_artifact_id: str | None = None
+    source_deleted: bool = False
+    created_at: str
+    available: bool
+
+
+class ResOperation(BaseModel):
+    id: str
+    message_id: str | None = None
+    command: str
+    context: ContextId
+    status: OperationStatus
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] | None = None
+    error: str | None = None
+    created_at: str
+    started_at: str
+    completed_at: str | None = None
+
+
+class ResSessionDetail(BaseModel):
+    session: ResSession
+    messages: list[ResMessage]
+    operations: list[ResOperation]
+    artifacts: list[ResChatArtifact] = Field(default_factory=list)
+    restore_errors: list[str] = Field(default_factory=list)
+
+
+class ResChatParameter(BaseModel):
+    name: str
+    type: str
+    value: str
+    is_set: bool
+    is_none: bool
+
+
+class ResChatParameters(BaseModel):
+    context: ContextId
+    parameters: list[ResChatParameter]
+
+
+class ResChatChoices(BaseModel):
+    name: str
+    choices: list[str]
+
+
+class ReqChatAction(BaseModel):
+    command: ChatCommand | ServerEndpointAlias
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReqChatMessage(BaseModel):
+    content: str = Field(min_length=1, max_length=4000)
+    image: str | None = None
+
+
+class ReqChatMessageUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=16000)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResChatAction(BaseModel):
+    kind: Literal['text', 'operation', 'schedule', 'endpoint', 'error', 'session', 'import-control']
+    text: str = ''
+    data: dict[str, Any] = Field(default_factory=dict)
+    sections: list[dict[str, str]] = Field(default_factory=list)
+    operation_id: str | None = None
+
+
+class ResChatSubmission(BaseModel):
+    session: ResSession
+    user_message: ResMessage
+    assistant_message: ResMessage
+    result: ResChatAction
+    artifacts: list[ResChatArtifact] = Field(default_factory=list)
+
+
+def _public_artifacts(session_id: str) -> list[dict[str, Any]]:
+    return [artifacts.public_artifact(item) for item in db.list_artifacts(session_id)]
+
+
+def _log_chat_error(operation: str, exc: Exception | None = None) -> None:
+    detail = f': {type(exc).__name__}: {exc}' if exc is not None else ''
+    log.error(f'Chat: {operation}{detail}')
+
+
+def _log_chat_warning(operation: str, exc: Exception | None = None) -> None:
+    detail = f': {type(exc).__name__}: {exc}' if exc is not None else ''
+    log.warning(f'Chat: {operation}{detail}')
+
+
+def _chat_error_result(result: dict[str, Any]) -> str:
+    if (result.get('message_metadata') or {}).get('format') == 'html':
+        return 'Imported file command failed'
+    return result.get('text') or 'Unknown error'
+
+
+_IMAGE_PAYLOAD_FIELDS = {'image', 'images', 'imageList', 'inputs', 'inits', 'mask', 'init_images', 'init_control', 'control', 'ip_adapter', 'face'}
+
+
+def _safe_operation_values(
+    values: dict[str, Any],
+    context: str | None = None,
+    session: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    safe_values = {name: value for name, value in values.items() if name not in _IMAGE_PAYLOAD_FIELDS}
+    if context == 'video' and session and (session.get('selected_image_ids') or session.get('selected_image_id')):
+        safe_values.pop('init_image', None)
+    return safe_values
+
+
+def _store_image_results(session_id: str, message_id: str, images: list, saved_images: list, source_artifact_id: str | None) -> list[dict[str, Any]]:
+    stored = []
+    for index, image_data in enumerate(images):
+        if not isinstance(image_data, str):
+            continue
+        saved_path = saved_images[index] if index < len(saved_images) and isinstance(saved_images[index], str) else None
+        display_name = artifacts.safe_display_name(saved_path) if saved_path else f'generated-{index + 1}.png'
+        try:
+            artifact = artifacts.create_generated_artifact(
+                session_id,
+                message_id,
+                image_data,
+                display_name,
+                saved_path=saved_path,
+                source_artifact_id=source_artifact_id,
+            )
+            stored.append(artifact)
+        except Exception as exc:
+            _log_chat_error('image artifact could not be stored', exc)
+    return stored
+
+
+def get_sessions(limit: int = Query(default=50, ge=1, le=100), offset: int = Query(default=0, ge=0)):
+    try:
+        return db.list_sessions(limit=limit, offset=offset)
+    except Exception as exc:
+        _log_chat_error('session listing', exc)
+        raise
+
+
+def create_session(req: ReqSessionCreate):
+    try:
+        return db.create_session(title=req.title, context=req.context)
+    except ValueError as exc:
+        _log_chat_error('session creation', exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _log_chat_error('session creation', exc)
+        raise
+
+
+def get_session(session_id: str):
+    try:
+        session = db.get_session(session_id)
+    except Exception as exc:
+        _log_chat_error(f'session={session_id} lookup failed', exc)
+        raise
+    if session is None:
+        _log_chat_error(f'session={session_id} lookup session not found', None)
+        raise HTTPException(status_code=404, detail='Chat session not found')
+    try:
+        return ResSessionDetail(
+            session=session,
+            messages=db.list_messages(session_id),
+            operations=db.list_operations(session_id),
+            artifacts=_public_artifacts(session_id),
+        )
+    except Exception as exc:
+        _log_chat_error(f'session={session_id} detail retrieval', exc)
+        raise
+
+
+_CONTROL_IMPORT_FIELDS = {
+    'prompt', 'negative_prompt', 'styles', 'steps', 'sampler_name', 'seed',
+    'cfg_name', 'cfg_scale', 'cfg_image', 'cfg_rescale', 'cfg_start', 'cfg_stop', 'cfg_true', 'cfg_adaptive',
+    'clip_skip', 'vae_type', 'tiling', 'hidiffusion', 'denoising_strength',
+    'resize_mode_before', 'resize_name_before', 'resize_context_before', 'width_before', 'height_before', 'scale_by_before',
+    'resize_mode_after', 'resize_name_after', 'resize_context_after', 'width_after', 'height_after', 'scale_by_after',
+    'batch_count', 'batch_size',
+}
+
+
+def import_control_settings(
+    session_id: str,
+    values: dict[str, Any],
+    defaults: dict[str, Any],
+    extras: dict[str, Any] | None = None,
+):
+    """Append a sparse Control settings revision and apply it to the image Chat draft."""
+    session = db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail='Chat session not found')
+    if session['context'] != 'image':
+        raise HTTPException(status_code=409, detail=f'Not yet implemented for {session["context"]} context')
+
+    unsupported = set(values) - _CONTROL_IMPORT_FIELDS
+    if unsupported:
+        raise HTTPException(status_code=422, detail=f'Unsupported Control parameters: {", ".join(sorted(unsupported))}')
+    try:
+        validated = api_control.ReqControl.model_validate(values).model_dump(mode='json', exclude_unset=True)
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail='Invalid Control generation parameters') from exc
+    try:
+        normalized_extras = commands.validate_control_extras(extras if extras is not None else {})
+    except commands.CommandError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    parameters = {
+        name: value for name, value in validated.items()
+        if value != defaults.get(name, api_control.ReqControl.model_fields[name].default)
+    }
+    drafts = dict(session.get('drafts') or {})
+    image_draft = dict(drafts.get('image') or {})
+    previous_revision = db.get_settings_revision(session_id, session.get('active_settings_revision_id')) \
+        if session.get('active_settings_revision_id') is not None else None
+    previous_snapshot = (previous_revision or {}).get('snapshot')
+    snapshot = {
+        'schema_version': 1,
+        'context': 'image',
+        'source': 'control-ui',
+        'captured_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'parameters': jsonable_encoder(parameters),
+        'extras': jsonable_encoder(normalized_extras),
+    }
+    image_draft = _apply_control_settings_snapshot(image_draft, snapshot, previous_snapshot)
+    drafts['image'] = image_draft
+    created = db.create_settings_revision(session_id, snapshot, drafts)
+    return {
+        'session': created['session'],
+        'imported': sorted(parameters),
+        'extras': sorted(normalized_extras),
+        'revision_id': created['revision']['id'],
+    }
+
+
+def save_chat_settings_revision(session_id: str):
+    """Save the current image Chat draft as a sparse settings revision."""
+    session = db.get_session(session_id)
+    if session is None:
+        raise commands.CommandError('Chat session not found')
+    if session['context'] != 'image':
+        raise commands.CommandError(f'Not yet implemented for {session["context"]} context')
+
+    drafts = dict(session.get('drafts') or {})
+    image_draft = dict(drafts.get('image') or {})
+    values = {name: image_draft[name] for name in _CONTROL_IMPORT_FIELDS if name in image_draft}
+    try:
+        validated = api_control.ReqControl.model_validate(values).model_dump(mode='json', exclude_unset=True)
+        extras = commands.validate_control_extras(image_draft.get('control_extras', {}))
+    except ValidationError as exc:
+        raise commands.CommandError('Current image draft contains invalid generation parameters') from exc
+
+    parameters = {
+        name: value for name, value in validated.items()
+        if value != api_control.ReqControl.model_fields[name].default
+    }
+    snapshot = {
+        'schema_version': 1,
+        'context': 'image',
+        'source': 'chat-draft',
+        'captured_at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'parameters': jsonable_encoder(parameters),
+        'extras': jsonable_encoder(extras),
+    }
+    return db.create_settings_revision(session_id, snapshot, drafts)
+
+
+def _validate_control_settings_revision(snapshot: Any) -> dict[str, Any]:
+    fields = {'schema_version', 'context', 'source', 'captured_at', 'parameters', 'extras'}
+    if not isinstance(snapshot, dict) or set(snapshot) != fields:
+        raise commands.CommandError('Settings revision has an invalid snapshot format')
+    if snapshot.get('schema_version') != 1:
+        raise commands.CommandError('Settings revision uses an unsupported schema version')
+    if snapshot.get('context') != 'image' or snapshot.get('source') not in {'control-ui', 'chat-draft'}:
+        raise commands.CommandError('Settings revision is not an image settings snapshot')
+    if not isinstance(snapshot.get('captured_at'), str) or not snapshot['captured_at']:
+        raise commands.CommandError('Settings revision has no capture timestamp')
+    parameters = snapshot.get('parameters')
+    extras = snapshot.get('extras')
+    if not isinstance(parameters, dict) or not isinstance(extras, dict):
+        raise commands.CommandError('Settings revision parameters and Extras must be objects')
+    unsupported = set(parameters) - _CONTROL_IMPORT_FIELDS
+    if unsupported:
+        raise commands.CommandError(f'Settings revision contains unsupported parameters: {", ".join(sorted(unsupported))}')
+    try:
+        parameters = api_control.ReqControl.model_validate(parameters).model_dump(mode='json', exclude_unset=True)
+        normalized_extras = commands.validate_control_extras(extras)
+    except ValidationError as exc:
+        raise commands.CommandError('Settings revision contains invalid Control parameters') from exc
+    if normalized_extras != extras:
+        raise commands.CommandError('Settings revision Extras are not in canonical sparse form')
+    return {**snapshot, 'parameters': parameters, 'extras': normalized_extras}
+
+
+def _apply_control_settings_snapshot(draft: dict[str, Any], snapshot: dict[str, Any], previous: Any = None):
+    updated = dict(draft)
+    previous_parameters = previous.get('parameters', {}) if isinstance(previous, dict) else {}
+    if not isinstance(previous_parameters, dict):
+        previous_parameters = {}
+    new_parameters = snapshot['parameters']
+    for name in previous_parameters:
+        if name not in new_parameters:
+            updated.pop(name, None)
+    updated.update(new_parameters)
+
+    old_extras = previous.get('extras', {}) if isinstance(previous, dict) else {}
+    new_extras = snapshot['extras']
+    if new_extras:
+        updated['control_extras'] = new_extras
+    elif old_extras:
+        updated.pop('control_extras', None)
+    return updated
+
+
+def restore_control_settings_revision(session_id: str, revision_id: int):
+    if not isinstance(revision_id, int) or isinstance(revision_id, bool) or revision_id < 1:
+        raise commands.CommandError('Settings revision ID must be a positive integer')
+    session = db.get_session(session_id)
+    if session is None:
+        raise commands.CommandError('Chat session not found')
+    if session['context'] != 'image':
+        raise commands.CommandError(f'Not yet implemented for {session["context"]} context')
+    revision = db.get_settings_revision(session_id, revision_id)
+    if revision is None:
+        raise commands.CommandError(f'No Control settings snapshot with ID {revision_id}')
+    snapshot = _validate_control_settings_revision(revision['snapshot'])
+    active_revision_id = session.get('active_settings_revision_id')
+    previous_revision = db.get_settings_revision(session_id, active_revision_id) if active_revision_id is not None else None
+    drafts = dict(session.get('drafts') or {})
+    image_draft = dict(drafts.get('image') or {})
+    image_draft = _apply_control_settings_snapshot(
+        image_draft,
+        snapshot,
+        (previous_revision or {}).get('snapshot'),
+    )
+    drafts['image'] = image_draft
+    activated = db.activate_settings_revision(session_id, revision_id, drafts)
+    if activated is None:
+        raise commands.CommandError(f'Could not activate Control settings snapshot {revision_id}')
+    return activated
+
+
+def get_session_parameters(session_id: str) -> ResChatParameters:
+    try:
+        session = db.get_session(session_id)
+    except Exception as exc:
+        _log_chat_error('session parameter lookup failed', exc)
+        raise
+    if session is None:
+        _log_chat_error(f'session={session_id} parameter lookup session not found')
+        raise HTTPException(status_code=404, detail='Chat session not found')
+    context = session['context']
+    draft = (session.get('drafts') or {}).get(context, {})
+    return ResChatParameters(
+        context=context,
+        parameters=commands.get_parameter_entries(context, draft),
+    )
+
+
+def get_session_parameter_choices(session_id: str, name: str = Query(...)) -> ResChatChoices:
+    session = db.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail='Chat session not found')
+    try:
+        draft = (session.get('drafts') or {}).get(session['context'], {})
+        choices = commands.get_parameter_choices(session['context'], name, draft)
+    except commands.CommandError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return ResChatChoices(name=name, choices=choices)
+
+
+def restore_session(session_id: str):
+    try:
+        session = db.get_session(session_id)
+    except Exception as exc:
+        _log_chat_error(f'restore session={session_id}', exc)
+        raise
+    if session is None:
+        _log_chat_error(f'restore session={session_id} not found')
+        raise HTTPException(status_code=404, detail='Chat session not found')
+    restore_errors = commands.restore_session_state(session_id)
+    for item in _public_artifacts(session_id):
+        if not item['available']:
+            error = f'image={item["display_name"]} unavailable'
+            restore_errors.append(error)
+            # _log_chat_error(f'restore session={session_id} {error}')
+    return ResSessionDetail(
+        session=db.get_session(session_id),
+        messages=db.list_messages(session_id),
+        operations=db.list_operations(session_id),
+        artifacts=_public_artifacts(session_id),
+        restore_errors=restore_errors,
+    )
+
+
+def _execute_chat_operation(session_id: str, user_message: dict[str, Any], result: dict[str, Any], api_instance):
+    data = result.get('data') or {}
+    descriptors = data.get('endpoints')
+    if data.get('alias') != 'generate' or not isinstance(descriptors, list) or len(descriptors) != 1:
+        raise ValueError('Invalid chat generation descriptor')
+    operation_command = data.get('command', 'generate')
+    if operation_command not in {'generate', 'again', 'run'}:
+        raise ValueError('Invalid chat operation command')
+    run_count = data.get('run_count', 1)
+    if not isinstance(run_count, int) or not 1 <= run_count <= 100:
+        raise ValueError('Invalid chat run count')
+    descriptor = descriptors[0]
+    if not isinstance(descriptor, dict) or descriptor.get('method') != 'POST':
+        raise ValueError('Invalid chat generation endpoint')
+    handlers = {
+        '/sdapi/v1/control': 'image',
+        '/sdapi/v1/video': 'video',
+        '/sdapi/v1/extra-batch-images': 'process',
+        '/sdapi/v1/vqa': 'caption',
+    }
+    context = handlers.get(descriptor.get('path'))
+    session = db.get_session(session_id)
+    if context is None or session is None or session['context'] != context:
+        raise ValueError('Chat generation endpoint does not match the session context')
+    if run_count > 1 and context != 'image':
+        raise ValueError('Repeated runs are supported only in image context')
+    arguments = descriptor.get('arguments')
+    if not isinstance(arguments, dict):
+        raise ValueError('Invalid chat generation arguments')
+
+    operation_snapshot = _safe_operation_values(arguments, context, session)
+    if context == 'image':
+        operation_snapshot['settings_revision_id'] = session.get('active_settings_revision_id')
+    operation = db.create_operation(
+        session_id,
+        operation_command,
+        context,
+        operation_snapshot,
+        message_id=user_message['id'],
+    )
+    operation_id = operation['id']
+    try:
+        if context == 'image':
+            control_api_instance = getattr(api_instance, 'control', None)
+            if control_api_instance is None:
+                raise RuntimeError('The control generation API is unavailable')
+            responses = []
+            errors = []
+            first_exception = None
+            for run_index in range(run_count):
+                try:
+                    response = control_api_instance.post_control(api_control.ReqControl.model_validate(arguments))
+                except Exception as exc:
+                    first_exception = first_exception or exc
+                    errors.append(f'Run {run_index + 1}: {exc}')
+                    continue
+                responses.append(response)
+                response_error = getattr(response, 'error', None)
+                if response_error:
+                    errors.append(f'Run {run_index + 1}: {response_error}')
+            if not responses:
+                if run_count == 1 and first_exception is not None:
+                    raise first_exception
+                raise RuntimeError('\n'.join(errors)) from first_exception
+            images = [image for response in responses for image in (response.images or [])]
+            info = '\n'.join(response.info for response in responses if response.info)
+            stats = '\n'.join(response.stats for response in responses if getattr(response, 'stats', ''))
+            saved_images = [path for response in responses for path in (getattr(response, 'saved_images', []) or [])]
+            parameters = _safe_operation_values(responses[-1].params or {})
+            stored_artifacts = _store_image_results(
+                session_id, user_message['id'], images, saved_images, session.get('selected_image_id'),
+            )
+            completion_text = f'<span class="chat-processed">Generated {len(images)} image(s)</span>'
+            error = '\n'.join(errors)
+            if error:
+                completion_text += f'\nError: {error}'
+            if info:
+                completion_text += f'\n{info}'
+            if stats:
+                completion_text += stats
+            output_data = {
+                'images': images,
+                'info': info,
+                'stats': stats,
+                'parameters': parameters,
+                'error': error or None,
+                'artifacts': [artifacts.public_artifact(item) for item in stored_artifacts],
+            }
+            saved_result = {
+                'image_count': len(images),
+                'run_count': run_count,
+                'info': info,
+                'stats': stats,
+                'parameters': parameters,
+                'error': error or None,
+            }
+            message_metadata = {'image_count': len(images), 'format': 'html'}
+        elif context == 'video':
+            from modules.api.video import ReqVideo
+            video_api_instance = getattr(api_instance, 'video', None)
+            if video_api_instance is None:
+                raise RuntimeError('The video generation API is unavailable')
+            request = ReqVideo.model_validate(arguments)
+            response = video_api_instance.post_video(request)
+            info = response.info or ''
+            completion_text = 'Generated video'
+            if info:
+                completion_text += f'\n{info}'
+            output_data = {
+                'video': response.video,
+                'video_path': response.video_path,
+                'thumbnail': response.thumbnail,
+                'frames': response.frames,
+                'info': info,
+                'parameters': response.params,
+            }
+            saved_result = {'frames_count': response.frames_count, 'info': info, 'parameters': response.params}
+            message_metadata = {'format': 'html'}
+        elif context == 'process':
+            from modules.api import models
+            process_api_instance = getattr(api_instance, 'process', None)
+            if process_api_instance is None:
+                raise RuntimeError('The image processing API is unavailable')
+            request = models.ReqProcessBatch.model_validate(arguments)
+            response = process_api_instance.extras_batch_images_api(request)
+            info = response.html_info or ''
+            images = response.images or []
+            completion_text = f'<span class="chat-processed">Processed {len(images)} image(s)</span>'
+            if info:
+                completion_text += f'<br>{info}'
+            source_artifact_id = session.get('selected_image_id')
+            stored_artifacts = _store_image_results(session_id, user_message['id'], images, [], source_artifact_id)
+            output_data = {
+                'images': images,
+                'info': info,
+                'artifacts': [artifacts.public_artifact(item) for item in stored_artifacts],
+            }
+            saved_result = {'image_count': len(images), 'info': info}
+            message_metadata = {'format': 'html', 'image_count': len(images)}
+        else:
+            from modules.api.caption import ReqVQA, post_vqa
+            request = ReqVQA.model_validate(arguments)
+            response = post_vqa(request)
+            completion_text = response.answer or 'Caption complete'
+            output_data = {'caption': response.answer, 'annotated_image': response.annotated_image}
+            saved_result = {'caption': response.answer}
+            message_metadata = {}
+        db.update_operation(
+            operation_id,
+            'completed',
+            result=saved_result,
+        )
+        if context in {'image', 'video'}:
+            db.update_session(
+                session_id,
+                last_generation_prompt=str(arguments.get('prompt') or ''),
+                last_generation_snapshot=_safe_operation_values(arguments, context, session),
+            )
+        result.update({
+            'text': completion_text,
+            'operation_id': operation_id,
+            'data': output_data,
+            'message_metadata': {
+                'kind': 'operation',
+                'operation_id': operation_id,
+                'status': 'completed',
+                **message_metadata,
+            },
+        })
+    except Exception as exc:
+        _log_chat_error(f'context={context} operation', exc)
+        db.update_operation(operation_id, 'failed', error=str(exc))
+        result.update({
+            'kind': 'error',
+            'text': f'{context.capitalize()} operation failed: {exc}',
+            'operation_id': operation_id,
+            'data': {},
+            'message_metadata': {
+                'kind': 'error',
+                'operation_id': operation_id,
+                'status': 'failed',
+                'failed': True,
+            },
+        })
+    return result
+
+
+def _schedule_chat_operation(result: dict[str, Any]):
+    from modules import scheduler
+    descriptors = (result.get('data') or {}).get('endpoints')
+    if not isinstance(descriptors, list) or len(descriptors) != 1 or not isinstance(descriptors[0], dict):
+        raise ValueError('Invalid chat schedule descriptor')
+    descriptor = descriptors[0]
+    arguments = descriptor.get('arguments')
+    if not isinstance(arguments, dict):
+        raise ValueError('Invalid chat schedule arguments')
+    if descriptor.get('path') == '/sdapi/v1/control':
+        scheduler_arguments = {
+            name: value for name, value in arguments.items()
+            if name not in {'send_images', 'save_images'}
+        }
+        response = next(scheduler.enqueue_control_request(**scheduler_arguments))
+        text = response[2]
+    elif descriptor.get('path') == '/sdapi/v1/video':
+        response = scheduler.enqueue_video_request('video', **arguments)
+        text = response[4]
+    else:
+        raise ValueError('Scheduling is not available for this chat context')
+    return {'kind': 'schedule', 'text': text, 'data': {}}
+
+
+def _execute_import_endpoint(result: dict[str, Any]) -> dict[str, Any]:
+    descriptors = (result.get('data') or {}).get('endpoints')
+    if not isinstance(descriptors, list) or not descriptors:
+        raise ValueError('Invalid imported endpoint command')
+    from modules.api import gpu, models, server
+    handlers = {
+        '/sdapi/v1/version': (server.get_version, None),
+        '/sdapi/v1/platform': (server.get_platform, None),
+        '/sdapi/v1/torch': (server.get_torch, None),
+        '/sdapi/v1/gpu': (gpu.get_gpu, None),
+        '/sdapi/v1/gpu-smi': (gpu.get_gpu_smi, None),
+        '/sdapi/v1/memory': (server.get_memory, None),
+        '/sdapi/v1/status': (server.get_status, None),
+        '/sdapi/v1/progress': (server.get_progress, models.ReqProgress),
+        '/sdapi/v1/storage': (server.get_storage, models.ReqStorage),
+    }
+    output = []
+    for descriptor in descriptors:
+        if not isinstance(descriptor, dict) or descriptor.get('method') != 'GET':
+            raise ValueError('Invalid imported endpoint descriptor')
+        handler_spec = handlers.get(descriptor.get('path'))
+        arguments = descriptor.get('arguments', {})
+        if handler_spec is None or not isinstance(arguments, dict):
+            raise ValueError('Unsupported imported endpoint')
+        handler, request_model = handler_spec
+        response = handler(req=request_model.model_validate(arguments)) if request_model else handler()
+        content = json.dumps(jsonable_encoder(response), indent=2, ensure_ascii=False)
+        if len(content) > 12000:
+            content = f'{content[:12000]}\n[Output truncated]'
+        output.append(f'{descriptor.get("alias", "endpoint")}:\n{content}')
+    return {'kind': 'text', 'text': '\n\n'.join(output), 'data': {}}
+
+
+def _import_staged_file(session_id: str, user_message: dict[str, Any], imported: dict[str, Any], api_instance, depth: int = 0):
+    if imported['kind'] == 'image':
+        try:
+            artifact = artifacts.create_image_artifact(session_id, user_message['id'], imported['path'], imported['display_name'], role='input')
+            db.set_selected_image(session_id, artifact['id'])
+        except Exception as exc:
+            _log_chat_error('image import', exc)
+            from pathlib import Path
+            Path(imported['path']).unlink(missing_ok=True)
+            raise ValueError('Image file could not be imported') from None
+        public = artifacts.public_artifact(artifact)
+        return {
+            'kind': 'text',
+            'text': f'Imported and selected image: {public["display_name"]}',
+            'data': {'artifacts': [public]},
+            'message_metadata': {'kind': 'text', 'data': {'artifacts': [public]}},
+        }
+
+    from pathlib import Path
+    staged_path = Path(imported['path'])
+    results = []
+    failed = False
+    progress_job = f'Chat file import: {imported["display_name"]}'
+    owns_progress = not shared.state.job
+    previous_textinfo = shared.state.textinfo
+    progress_updates = []
+    if owns_progress:
+        shared.state.job = progress_job
+    try:
+        lines = imported['content'].splitlines()
+        line_count = len(lines)
+        for line_number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            if owns_progress:
+                if not shared.state.job:
+                    shared.state.job = progress_job
+                if shared.state.job == progress_job:
+                    update = f'line {line_number}/{line_count}: {line}'
+                    progress_updates.append(f'Processing... {update}' if not progress_updates else update)
+                    shared.state.textinfo = '\n'.join(progress_updates)
+            line_result = _execute_chat_command(
+                session_id, user_message, line, None, api_instance, import_depth=depth + 1,
+            )
+            if line_result.get('kind') == 'endpoint':
+                try:
+                    line_result = _execute_import_endpoint(line_result)
+                except Exception as exc:
+                    line_result = {'kind': 'error', 'text': f'Endpoint command failed: {exc}', 'data': {}}
+            line_text = str(line_result.get('text') or '')
+            if line_result.get('kind') == 'error':
+                failed = True
+            line_metadata = line_result.get('message_metadata') or {}
+            if line_metadata.get('format') == 'html':
+                rendered_result = line_text
+            else:
+                rendered_result = escape(line_text)
+            label = escape(f'{imported["display_name"]}:{line_number}')
+            results.append(f'<div><span class="chat-file-line">{label}</span> {rendered_result}</div>')
+            if line_result.get('kind') == 'error':
+                break
+    finally:
+        staged_path.unlink(missing_ok=True)
+        if owns_progress and shared.state.job == progress_job:
+            shared.state.job = ''
+            shared.state.textinfo = previous_textinfo
+    if not results:
+        label = escape(imported['display_name'])
+        results.append(f'<div><span class="chat-file-line">{label}</span> No commands found</div>')
+    public_artifacts = _public_artifacts(session_id)
+    kind = 'error' if failed else 'text'
+    return {
+        'kind': kind,
+        'text': ''.join(results),
+        'data': {'artifacts': public_artifacts},
+        'message_metadata': {'kind': kind, 'format': 'html', 'data': {'artifacts': public_artifacts}},
+    }
+
+
+def _execute_chat_command(
+    session_id: str,
+    user_message: dict[str, Any],
+    content: str,
+    image: str | list[str] | None,
+    api_instance,
+    import_depth: int = 0,
+):
+    session = db.get_session(session_id)
+    if session is not None:
+        try:
+            image = _selected_image_for_command(session, content, image)
+        except ValueError as exc:
+            return {'kind': 'error', 'text': str(exc), 'data': {}}
+    result = commands.execute_command(session_id, content, image=image)
+    if result.get('kind') == 'import':
+        if import_depth >= 8:
+            return {'kind': 'error', 'text': 'Nested file imports are too deep', 'data': {}}
+        try:
+            imported = artifacts.copy_allowed_file(result['data']['path'])
+            return _import_staged_file(session_id, user_message, imported, api_instance, depth=import_depth)
+        except ValueError as exc:
+            return {'kind': 'error', 'text': str(exc), 'data': {}}
+    if result.get('kind') == 'operation':
+        return _execute_chat_operation(session_id, user_message, result, api_instance)
+    if result.get('kind') == 'schedule':
+        try:
+            return _schedule_chat_operation(result)
+        except Exception as exc:
+            return {'kind': 'error', 'text': f'Scheduler error: {exc}', 'data': {}}
+    return result
+
+
+def _selected_image_for_command(
+    session: dict[str, Any],
+    content: str,
+    fallback: str | list[str] | None,
+) -> str | list[str] | None:
+    try:
+        command = commands.parse_command(content)
+    except commands.CommandError:
+        return fallback
+    if command.name not in {'generate', 'run', 'again', 'schedule'}:
+        return fallback
+    artifact_ids = session.get('selected_image_ids') or ([session['selected_image_id']] if session.get('selected_image_id') else [])
+    if not artifact_ids:
+        if fallback is not None:
+            return fallback
+        if session['context'] == 'process':
+            for artifact in reversed(db.list_artifacts(session['id'])):
+                if artifact['role'] == 'result' and artifact['media_type'].startswith('image/') \
+                        and artifacts.public_artifact(artifact)['available']:
+                    return artifacts.read_image_base64(artifact)
+        return fallback
+    images = []
+    for artifact_id in artifact_ids:
+        artifact = db.get_artifact(session['id'], artifact_id)
+        if artifact is None or not artifacts.public_artifact(artifact)['available']:
+            raise ValueError('Selected image is unavailable')
+        images.append(artifacts.read_image_base64(artifact))
+    return images if session['context'] in {'image', 'process'} else images[0]
+
+
+def _transient_message(role: str, content: str, metadata: dict[str, Any] | None = None):
+    return {
+        'id': uuid.uuid4().hex,
+        'role': role,
+        'content': content,
+        'metadata': metadata or {},
+        'created_at': datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _finish_submission(
+    session_id: str,
+    user_message: dict[str, Any],
+    result: dict[str, Any],
+    persist: bool = True,
+):
+    try:
+        metadata = result.get('message_metadata', {
+            'kind': result.get('kind', 'text'),
+            'data': result.get('data', {}),
+        })
+        if result.get('sections'):
+            metadata['sections'] = result['sections']
+        if persist:
+            assistant_message = db.create_message(
+                session_id,
+                'assistant',
+                result.get('text', ''),
+                metadata=metadata,
+            )
+        else:
+            assistant_message = _transient_message('assistant', result.get('text', ''), metadata)
+        return ResChatSubmission(
+            session=db.get_session(session_id),
+            user_message=user_message,
+            assistant_message=assistant_message,
+            result=result,
+            artifacts=_public_artifacts(session_id),
+        )
+    except Exception as exc:
+        _log_chat_error('message persistence', exc)
+        raise
+
+
+async def upload_chat_file(session_id: str, upload: UploadFile, api_instance=None):
+    try:
+        session = db.get_session(session_id)
+    except Exception as exc:
+        _log_chat_error('file upload session lookup', exc)
+        raise
+    if session is None:
+        _log_chat_error('file upload session not found')
+        raise HTTPException(status_code=404, detail='Chat session not found')
+    try:
+        imported = await artifacts.stage_upload(upload)
+    except ValueError as exc:
+        _log_chat_error('file upload', exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _log_chat_error('file upload', exc)
+        raise HTTPException(status_code=400, detail='File could not be imported') from None
+    finally:
+        await upload.close()
+    try:
+        user_message = db.create_message(
+            session_id,
+            'user',
+            f'Imported file: {imported["display_name"]}',
+            metadata={'source': 'file-upload'},
+        )
+    except Exception as exc:
+        _log_chat_error('file upload message creation', exc)
+        raise
+    try:
+        result = _import_staged_file(session_id, user_message, imported, api_instance)
+    except Exception as exc:
+        _log_chat_error('imported file processing', exc)
+        result = {'kind': 'error', 'text': 'File could not be imported', 'data': {}}
+        staged_path = imported.get('path')
+        if imported['kind'] == 'image' and staged_path:
+            from pathlib import Path
+            Path(staged_path).unlink(missing_ok=True)
+    else:
+        if result.get('kind') == 'error':
+            _log_chat_error(f'file processing: {_chat_error_result(result)}')
+    return _finish_submission(session_id, user_message, result)
+
+
+def post_message(session_id: str, req: ReqChatMessage, api_instance=None):
+    progress.start_chat_operation()
+    try:
+        return _post_message(session_id, req, api_instance)
+    finally:
+        progress.finish_chat_operation()
+
+
+def _post_message(session_id: str, req: ReqChatMessage, api_instance=None):
+    try:
+        session = db.get_session(session_id)
+    except Exception as exc:
+        _log_chat_error('message session lookup', exc)
+        raise
+    if session is None:
+        _log_chat_error('message submission: session not found')
+        raise HTTPException(status_code=404, detail='Chat session not found')
+    content = req.content.strip()
+    if not content:
+        _log_chat_error('message submission: message is empty')
+        raise HTTPException(status_code=422, detail='Chat message cannot be empty')
+    command_lines = commands.split_commands(content)
+    transient = bool(command_lines) and all(commands.is_transient_command(line) for line in command_lines)
+    command_word = content.split(maxsplit=1)[0].casefold()
+    is_private_path_command = command_word in {'use', 'file'}
+    try:
+        if not transient and session['title'] == 'New chat' and command_word != 'title' and not is_private_path_command and not db.list_messages(session_id, limit=1):
+            title = content.splitlines()[0][:64]
+            db.update_session(session_id, title=title)
+        transcript_content = 'Server file import' if is_private_path_command else content
+        user_message = (
+            _transient_message('user', transcript_content)
+            if transient else db.create_message(session_id, 'user', transcript_content)
+        )
+    except Exception as exc:
+        _log_chat_error('message persistence', exc)
+        raise
+    try:
+        image = _selected_image_for_command(session, content, req.image)
+        result = _execute_chat_commands(session_id, user_message, command_lines, image, api_instance)
+    except Exception as exc:  # Keep a command failure in the persisted conversation.
+        _log_chat_error('command', exc)
+        result = {'kind': 'error', 'text': 'Command failed. Check the server log.', 'data': {}}
+    else:
+        if result.get('kind') == 'error':
+            _log_chat_error(f'command: {_chat_error_result(result)}')
+    return _finish_submission(session_id, user_message, result, persist=not transient)
+
+
+def _execute_chat_commands(
+    session_id: str,
+    user_message: dict[str, Any],
+    command_lines: list[str],
+    image: str | list[str] | None,
+    api_instance,
+):
+    if len(command_lines) == 1:
+        return _execute_chat_command(session_id, user_message, command_lines[0], image, api_instance)
+
+    results = []
+    for line in command_lines:
+        result = _execute_chat_command(session_id, user_message, line, image, api_instance)
+        results.append(result.get('text', ''))
+        if result.get('kind') != 'text':
+            result['text'] = '\n'.join(text for text in results if text)
+            return result
+    combined = {'kind': 'text', 'text': '\n'.join(text for text in results if text), 'data': {}}
+    if results and result.get('sections'):
+        combined['sections'] = result['sections']
+    return combined
+
+
+def get_chat_artifact_content(session_id: str, artifact_id: str):
+    try:
+        artifact = db.get_artifact(session_id, artifact_id)
+    except Exception as exc:
+        _log_chat_error('image content lookup', exc)
+        raise
+    if artifact is None or not artifacts.public_artifact(artifact)['available']:
+        _log_chat_error('image content request: artifact unavailable')
+        raise HTTPException(status_code=404, detail='Chat image artifact unavailable')
+    try:
+        return FileResponse(
+            artifact['storage_ref'],
+            media_type=artifact['media_type'],
+            filename=artifact['display_name'],
+        )
+    except Exception as exc:
+        _log_chat_error('image content request', exc)
+        raise
+
+
+def _get_available_chat_image(session_id: str, artifact_id: str):
+    try:
+        artifact = db.get_artifact(session_id, artifact_id)
+    except Exception as exc:
+        _log_chat_error('image operation lookup', exc)
+        raise
+    if artifact is None or not artifact['media_type'].startswith('image/') \
+            or not artifacts.public_artifact(artifact)['available']:
+        _log_chat_error('image operation: artifact unavailable')
+        raise HTTPException(status_code=404, detail='Chat image artifact unavailable')
+    return artifact
+
+
+def open_chat_artifact_folder(session_id: str, artifact_id: str):
+    artifact = _get_available_chat_image(session_id, artifact_id)
+    import os
+    import platform
+    import shutil
+    import subprocess
+    from pathlib import Path
+    if shared.cmd_opts.hide_ui_dir_config:
+        return {'opened': False}
+    folder = Path(artifact['storage_ref']).parent
+    if not folder.is_dir():
+        _log_chat_error(f'image folder open: folder unavailable: {folder}')
+        raise HTTPException(status_code=404, detail='Chat image folder unavailable')
+    system = platform.system()
+    try:
+        if system == 'Windows':
+            os.startfile(str(folder))  # pylint: disable=no-member
+        elif system == 'Darwin':
+            subprocess.Popen(['open', str(folder)])  # pylint: disable=consider-using-with
+        elif 'microsoft-standard-WSL2' in platform.uname().release:
+            opener = 'wslview' if shutil.which('wslview') is not None else 'wsl-open'
+            subprocess.Popen([opener, str(folder)])  # pylint: disable=consider-using-with
+        else:
+            subprocess.Popen(['xdg-open', str(folder)])  # pylint: disable=consider-using-with
+    except Exception as exc:
+        _log_chat_error('image folder open', exc)
+        raise HTTPException(status_code=500, detail='Chat image folder unavailable') from exc
+    return {'opened': True}
+
+
+def save_chat_artifact(session_id: str, artifact_id: str):
+    artifact = _get_available_chat_image(session_id, artifact_id)
+    from types import SimpleNamespace
+    from PIL import Image
+    from modules import images, infotext, paths
+    try:
+        with Image.open(artifact['storage_ref']) as image:
+            image.load()
+            info, _items = images.read_info_from_image(image)
+            params = infotext.parse(info) if info else {}
+            prompt = params.get('Prompt') or ''
+            negative_prompt = params.get('Negative prompt') or ''
+            sampler = params.get('Sampler') or ''
+            try:
+                seed = int(params.get('Seed') or 0)
+            except (TypeError, ValueError):
+                seed = 0
+            try:
+                steps = int(params.get('Steps') or 0)
+            except (TypeError, ValueError):
+                steps = 0
+            styles = params.get('Styles') or []
+            if isinstance(styles, str):
+                styles = [style.strip() for style in styles.split(',')]
+            save_params = SimpleNamespace(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                sampler=sampler,
+                sampler_name=sampler,
+                seed=seed,
+                steps=steps,
+                cfg_scale=params.get('CFG scale') or 0,
+                clip_skip=params.get('Clip skip') or 1,
+                denoising_strength=params.get('Denoising strength') or 0,
+                width=image.width,
+                height=image.height,
+                styles=styles,
+                n_iter=1,
+                batch_size=1,
+                iteration=0,
+                batch_index=0,
+                all_seeds=[seed],
+                all_prompts=[prompt],
+                all_negative_prompts=[negative_prompt],
+                index_of_first_image=0,
+            )
+            saved_path, _text_path, _exif = images.save_image(
+                image,
+                path=paths.resolve_output_path(shared.opts.outdir_samples, shared.opts.outdir_save),
+                seed=seed,
+                prompt=prompt,
+                info=info,
+                extension=shared.opts.samples_format,
+                p=save_params,
+            )
+    except Exception as exc:
+        _log_chat_error('image save', exc)
+        raise HTTPException(status_code=500, detail='Chat image could not be saved') from exc
+    if not saved_path:
+        _log_chat_error('image save: no output file was created')
+        raise HTTPException(status_code=500, detail='Chat image could not be saved')
+    return {'saved': True}
+
+
+def delete_chat_artifact(session_id: str, artifact_id: str):
+    try:
+        artifact = db.get_artifact(session_id, artifact_id)
+    except Exception as exc:
+        _log_chat_error('image deletion lookup failed', exc)
+        raise
+    if artifact is None or not artifact['media_type'].startswith('image/'):
+        _log_chat_error('image deletion: artifact not found')
+        raise HTTPException(status_code=404, detail='Chat image artifact not found')
+    try:
+        artifacts.delete_storage_file(artifact)
+        db.delete_artifact(session_id, artifact_id)
+        log.warning(f'Chat: Delete: image="{artifact["storage_ref"]}"')
+    except ValueError as exc:
+        _log_chat_error(f'image deletion: image="{artifact["storage_ref"]}"', exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _log_chat_error(f'image deletion: {artifact["display_name"]}', exc)
+        raise
+    return {'deleted': True, 'id': artifact_id}
+
+
+def patch_message(session_id: str, message_id: str, req: ReqChatMessageUpdate):
+    if req.metadata.get('kind') != 'endpoint':
+        _log_chat_error('message update rejected: only endpoint results can be updated')
+        raise HTTPException(status_code=400, detail='Only endpoint results can update an assistant message')
+    try:
+        message = db.update_message(session_id, message_id, req.content, req.metadata)
+    except ValueError as exc:
+        _log_chat_error('message update', exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _log_chat_error('message update', exc)
+        raise
+    if message is None:
+        _log_chat_error('message update: endpoint response not found')
+        raise HTTPException(status_code=404, detail='Chat endpoint response message not found')
+    return message
+
+
+def update_session(session_id: str, req: ReqSessionUpdate):
+    updates = req.model_dump(exclude_unset=True)
+    if 'selected_image_ids' in updates or 'selected_image_id' in updates:
+        if 'selected_image_ids' in updates:
+            selected_image_ids = updates['selected_image_ids'] or []
+        else:
+            selected_image_id = updates['selected_image_id']
+            selected_image_ids = [selected_image_id] if selected_image_id else []
+        selected_image_ids = list(dict.fromkeys(selected_image_ids))
+        try:
+            session = db.get_session(session_id)
+        except Exception as exc:
+            _log_chat_error('session update lookup failed', exc)
+            raise
+        if session is None:
+            _log_chat_error('session update: session not found')
+            raise HTTPException(status_code=404, detail='Chat session not found')
+        for selected_image_id in selected_image_ids:
+            try:
+                artifact = db.get_artifact(session_id, selected_image_id)
+            except Exception as exc:
+                _log_chat_error('session image selection lookup failed', exc)
+                raise
+            if artifact is None or not artifact['media_type'].startswith('image/') \
+                    or not artifacts.public_artifact(artifact)['available']:
+                _log_chat_error('session update: selected image is unavailable')
+                raise HTTPException(status_code=400, detail='Selected image is not available in this session')
+            updates['selected_image_ids'] = selected_image_ids
+            updates['selected_image_id'] = selected_image_ids[0] if selected_image_ids else None
+    try:
+        session = db.update_session(session_id, **updates)
+    except ValueError as exc:
+        _log_chat_error('session update', exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        _log_chat_error('session update', exc)
+        raise
+    if session is None:
+        _log_chat_error('session update: session not found')
+        raise HTTPException(status_code=404, detail='Chat session not found')
+    return session
+
+
+def delete_session(session_id: str):
+    try:
+        deleted = db.delete_session(session_id)
+    except Exception as exc:
+        _log_chat_error('session deletion', exc)
+        raise
+    if not deleted:
+        _log_chat_error('session deletion: session not found')
+        raise HTTPException(status_code=404, detail='Chat session not found')
+    return Response(status_code=204)
+
+
+def register_api(api, diag: bool = False):
+    api.add_api_route('/sdapi/v1/chat/status', get_chat_status, methods=['GET'], response_model=ResChatStatus, tags=['Chat'])
+    try:
+        db.initialize()
+    except (sqlite3.Error, OSError) as exc:
+        _session_state['initialization_failed'] = True
+        log.error(f'Chat disabled: {exc}')
+        return False
+    if diag:
+        try:
+            stats = db.diagnostics()
+            log.info(f'Chat database diagnostics: {stats}')
+            if not stats['ok']:
+                log.error('Chat: database diagnostics found integrity or schema issues')
+        except Exception as exc:
+            log.error(f'Chat: database diagnostics failed: {exc}')
+
+    def post_message_route(session_id: str, req: ReqChatMessage):
+        return post_message(session_id, req, api)
+
+    async def upload_chat_file_route(session_id: str, file: UploadFile = File(...)):
+        return await upload_chat_file(session_id, file, api)
+
+    api.add_api_route('/sdapi/v1/chat/sessions', get_sessions, methods=['GET'], response_model=list[ResSession], tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions', create_session, methods=['POST'], response_model=ResSession, tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}', get_session, methods=['GET'], response_model=ResSessionDetail, tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}', update_session, methods=['PATCH'], response_model=ResSession, tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}', delete_session, methods=['DELETE'], status_code=204, tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}/parameters', get_session_parameters, methods=['GET'], response_model=ResChatParameters, tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}/choices', get_session_parameter_choices, methods=['GET'], response_model=ResChatChoices, tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}/restore', restore_session, methods=['POST'], response_model=ResSessionDetail, tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}/messages', post_message_route, methods=['POST'], response_model=ResChatSubmission, tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}/files', upload_chat_file_route, methods=['POST'], response_model=ResChatSubmission, tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}/messages/{message_id}', patch_message, methods=['PATCH'], response_model=ResMessage, tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}/artifacts/{artifact_id}/content', get_chat_artifact_content, methods=['GET'], tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}/artifacts/{artifact_id}/open-folder', open_chat_artifact_folder, methods=['POST'], tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}/artifacts/{artifact_id}/save', save_chat_artifact, methods=['POST'], tags=['Chat'])
+    api.add_api_route('/sdapi/v1/chat/sessions/{session_id}/artifacts/{artifact_id}', delete_chat_artifact, methods=['DELETE'], tags=['Chat'])
+    return True

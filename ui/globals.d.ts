@@ -19,6 +19,26 @@ declare global {
     sparkline?: (data: any, options?: any) => JQuery;
   }
 
+  interface ChatPromptAutocompleteOption {
+    label: string;
+    kind: 'tag' | 'lora' | 'embed' | 'wildcard';
+    detail: string;
+    glyph: string;
+    color: string;
+    count: string;
+    from: number;
+    to: number;
+    insert: string;
+    cursor: number;
+  }
+
+  interface ChatPromptAutocompleteResult {
+    from: number;
+    to: number;
+    query: string;
+    options: ChatPromptAutocompleteOption[];
+  }
+
   interface Window {
     // state objects
     api: string; // ui/startup.ts
@@ -31,6 +51,9 @@ declare global {
     submit_state?: string; // ui/ui.ts
     logRingBuffer: { ts: string; type: string; msg: unknown[] }[]; // ui/logger.ts
     logBufferDirty: boolean; // ui/logger.ts
+    chatPromptAutocomplete?: {
+      search: (value: string, selectionStart: number, selectionEnd: number) => ChatPromptAutocompleteResult | null;
+    };
 
     // global functions
     args_to_array?: typeof Array.from; // ui/ui.ts
@@ -38,6 +61,11 @@ declare global {
     notifyKanvasResize?: (width: number, height: number) => void; // ui/ui.ts
     cycleImageFit?: () => void; // ui/imageViewer.ts
     galleryClickEventHandler?: (event: MouseEvent) => void; // ui/imageViewer.ts
+    chatImageViewer?: {
+      navigate: (artifactId: string, offset: number) => Promise<{ artifactId: string; src: string } | null>;
+      download: (artifactId: string) => Promise<void>;
+      remove: (artifactId: string) => void;
+    }; // extensions-builtin/sdnext-modernui/src/chat.ts
     clip_gallery_urls?: (gallery: { data: string }[]) => void; // ui/ui.ts
     extract_image_from_gallery?: (gallery: { data?: string }[]) => ({ data?: string } | null)[]; // ui/ui.ts
     extensions_apply?: (_extensionsDisabledList: unknown, _extensionsUpdateList: unknown, disableAll: unknown) => [string, string, unknown]; // ui/extensions.ts

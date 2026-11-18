@@ -10,7 +10,7 @@ from modules.ltx.ltx_diffusers_patch import apply_patch as apply_ltx_diffusers_p
 from modules.ltx.ltx_util import get_bucket, get_frames, load_model, load_upsample, load_upsample_2x, get_conditions, get_generator, get_prompts, ltx_scheduler_opts, vae_decode
 
 apply_ltx_diffusers_patch()
-from modules.processing_callbacks import diffusers_callback
+from modules.processing_callbacks import diffusers_callback, set_callbacks_p
 from modules.video_models import video_run, video_utils
 from modules.video_models.video_vae import set_vae_params
 from modules.video_models.video_save import save_video, get_audio_rate
@@ -285,6 +285,7 @@ def run(model: str, *,
             width=base_w,
             height=base_h,
             frames=get_frames(frames),
+            video_output_fps=float(mp4_fps),
             cfg_scale=cfg_scale,
             denoising_strength=float(condition_strength) if condition_strength is not None else 1.0,
             init_image=init_image,
@@ -378,6 +379,7 @@ def run(model: str, *,
                     # re-anchor so the text encoder doesn't stay pinned through Stage 1 forward.
                     shared.sd_model = sd_models.apply_balanced_offload(shared.sd_model, force=True, silent=True)
                     devices.torch_gc(force=True, reason='ltx:encode')
+                    set_callbacks_p(p) # the pipe is called directly, so process_images does not set it
                     latents = _latent_pass(
                         caps=caps,
                         prompt_embeds=prompt_embeds,
@@ -403,8 +405,9 @@ def run(model: str, *,
                 else:
                     processed = processing.process_images(p)
                     if processed is None or processed.images is None or len(processed.images) == 0:
-                        # process_images swallows the interrupt assertion, so an empty result is the
-                        # only place a cancel and a genuine failure are still distinguishable
+                        # process_images swallows pass errors and the interrupt assertion; state.error tells them apart
+                        if shared.state.error:
+                            reject(shared.state.error, 500)
                         if shared.state.interrupted or shared.state.skipped:
                             reject('interrupted', 499)
                         reject('process_images returned no frames', 500)
@@ -467,6 +470,7 @@ def run(model: str, *,
                         log.debug(f'Video: op=upsample family=2.x latents={latents.shape} auto={auto_refine_upsample} {up_args}')
                         latents = upsample_pipe_2x(latents=latents, **up_args).frames[0]
                         upsample_pipe_2x = sd_models.apply_balanced_offload(upsample_pipe_2x, exclude=upsample_exclude, silent=True)
+                    p.width, p.height = final_w, final_h # the latents are at the upsampled size from here on
                     t5 = time.time()
                     timer.process.add('upsample', t5 - t4)
 
@@ -557,6 +561,7 @@ def run(model: str, *,
                             refine_args['negative_prompt_attention_mask'],
                         )
                         log.debug(f'Video: op=refine cls={caps.repo_cls_name} latents={latents.shape} canonical_stage2={caps.supports_canonical_stage2}')
+                        set_callbacks_p(p)
                         result = shared.sd_model(latents=latents, **refine_args)
                         out = result.frames[0] if hasattr(result, 'frames') else None
                         if want_audio:
@@ -614,9 +619,9 @@ def run(model: str, *,
                 x = x * 2.0 - 1.0
                 pixels = x.permute(1, 0, 2, 3).unsqueeze(0)
 
-            # LTX is conditioned on mp4_fps as the source rate; scale saved fps to keep duration constant
+            # Preserve the output duration after interpolation and FrameGen add frames.
             from modules.processing_video import interpolation_factor
-            save_fps = mp4_fps * interpolation_factor(p)
+            save_fps = video_run.get_video_save_fps(p, mp4_fps, interpolation_factor(p))
             num_frames, video_file, thumb_file = save_video(
                 p=p,
                 pixels=pixels,
@@ -638,7 +643,7 @@ def run(model: str, *,
 
             out_w, out_h = video_utils.pixel_size(pixels, fallback=(p.width, p.height))
             total_time = max(time.time() - t0, 1e-6)
-            log.info(f'Processed: fn="{video_file}" frames={num_frames} fps={num_frames/total_time:.2f} its={p.steps/total_time:.3f} resolution={out_w}x{out_h} time={total_time:.2f}')
+            log.info(f'Processed: fn="{video_file}" frames={num_frames} fps={save_fps} its={p.steps/total_time:.3f} resolution={out_w}x{out_h} time={total_time:.2f}')
             # the decode paths never materialize PIL, so frames come back through the saved file
             images_out = pixels if isinstance(pixels, list) else []
             processed_out = processing.Processed(p, images_out, seed=p.seed, audio=audio_out)

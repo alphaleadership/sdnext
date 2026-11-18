@@ -70,8 +70,8 @@ EXAMPLE_DOC_STRING = """
 def prompt_to_json(prompt):
     """Normalize a JSON caption to the compact form Ideogram 4 trained on, or wrap plain text.
     Ideogram 4 expects a structured JSON caption serialized compactly. A valid JSON prompt is
-    re-serialized to that form; a plain-text prompt is wrapped in a minimal caption so it stays
-    in distribution instead of tripping the weight-baked "blocked by safety filter" placeholder.
+    re-serialized to that form; a plain-text prompt is wrapped in a minimal caption, which still
+    often returns the weight-baked "blocked by safety filter" placeholder.
     """
     import json
     if isinstance(prompt, list):
@@ -430,8 +430,8 @@ class Ideogram4Pipeline(DiffusionPipeline):
         from modules import shared, devices
         if not shared.opts.model_ideogram4_enable_pe:
             prompt = prompt_to_json(prompt)
-        self.text_encoder.to(self._execution_device)
         try:
+            self.text_encoder.to(self._execution_device) # a move that fails partway leaves the moved part on the gpu
             prompt = self._encode_prompt(prompt, grid_h, grid_w, max_sequence_length, device)
         finally:
             if shared.opts.diffusers_offload_mode != 'none':

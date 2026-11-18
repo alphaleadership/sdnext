@@ -1,8 +1,6 @@
-from fractions import Fraction
 import os
 import re
 import time
-import cv2
 import numpy as np
 import torch
 import einops
@@ -11,6 +9,7 @@ from modules import shared, errors ,timer, rife, processing
 from modules.logger import log
 from modules.video_models.video_utils import check_av
 from modules.video_models.video_upscale import upscale_video
+from modules.video_models.video_writer import open_video_writer, rejected_options
 
 
 def get_audio_rate(p=None, default: int = 24000) -> int:
@@ -35,11 +34,10 @@ def get_video_filename(p:processing.StableDiffusionProcessingVideo):
         dirname = os.path.join(base_path, dirname, dirfile)
     else:
         dirname = base_path
-    if not os.path.exists(dirname):
-        os.makedirs(dirname, exist_ok=True)
     filename = os.path.join(dirname, filename)
+    filename = namegen.sanitize(filename, base=base_path) # before numbering and folder creation, so both see the folder that is used
     filename = namegen.sequence(filename)
-    filename = namegen.sanitize(filename)
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
     return filename
 
 
@@ -115,153 +113,55 @@ def numpy_to_tensor(images):
     return tensor
 
 
-def add_audio_packets(container, audio_stream, audio: dict):
-    if not audio or "frames" not in audio:
-        return
-    try:
-        av = check_av()
-        sr = audio.get("sr", 44100)
-        layout = audio.get("layout", "stereo")
-        resampler = av.AudioResampler(format="fltp", layout=layout, rate=sr)
-        fifo = av.AudioFifo()
-        for raw_frame in audio.get("frames", []):
-            for resampled in resampler.resample(raw_frame):
-                fifo.write(resampled)
-        for resampled in resampler.resample(None):
-            fifo.write(resampled)
-        pts_counter = 0
-        frame_size = audio_stream.codec_context.frame_size or 1024
-        while fifo.samples >= frame_size:
-            frame = fifo.read(frame_size)
-            frame.pts = pts_counter
-            pts_counter += frame.samples
-            for packet in audio_stream.encode(frame):
-                packet.stream = audio_stream
-                container.mux_one(packet)
-        if fifo.samples > 0:
-            frame = fifo.read(fifo.samples)
-            frame.pts = pts_counter
-            pts_counter += frame.samples
-            for packet in audio_stream.encode(frame):
-                packet.stream = audio_stream
-                container.mux_one(packet)
-        for packet in audio_stream.encode():
-            packet.stream = audio_stream
-            container.mux_one(packet)
-    except Exception as e:
-        log.error(f"Video audio encoding: type=packets {e}")
-        errors.display(e, "Audio")
-
-
-def add_audio_tensor(container, audio_stream, audio: torch.Tensor, sample_rate: int):
-    av = check_av()
-    if torch.is_tensor(audio):
-        audio = audio.detach().float().cpu().numpy()
-    if audio.ndim > 2:
-        audio = np.squeeze(audio)
-    if audio.ndim == 1:
-        audio = audio[None, :]
-    elif audio.ndim == 2 and audio.shape[0] > audio.shape[1] and audio.shape[1] in (1, 2):
-        audio = audio.T
-    channels = audio.shape[0] if audio.shape[0] in (1, 2) else 1
-    layout = "stereo" if channels == 2 else "mono"
-    if audio.dtype != np.int16:
-        audio = np.clip(audio, -1.0, 1.0)
-        audio = (audio * 32767.0).astype(np.int16)
-    audio_frame = av.AudioFrame.from_ndarray(audio, format="s16p", layout=layout)
-    audio_frame.sample_rate = sample_rate
-    add_audio_packets(container, audio_stream, {"sr": sample_rate, "layout": layout, "frames": [audio_frame]})
-
-
-def parse_options(options):
-    if isinstance(options, dict):
-        return options
-    if not isinstance(options, str) or not options.strip():
-        return {}
-    parsed_options = {}
-    normalized = options.replace(',', ':') # Standardize delimiters by replacing commas with colons
-    for item in normalized.split(':'):
-        item = item.strip()
-        if not item:
-            continue
-        if '=' in item:
-            key, value = item.split('=', 1)
-            parsed_options[key.strip()] = value.strip()
-        else:
-            parsed_options[item] = '1' # Handle flag options without explicit '=' (e.g., 'fastseek')
-    return parsed_options
-
-
-extra_option_keys = {'tune', 'maxrate', 'minrate', 'bufsize', 'g', 'bf', 'cq', 'lossless'} # rate and quality keys beyond the codec defaults
-
-
-def rejected_options(options) -> list[str]:
-    # options reach the encoder as-is, and keys such as stats or x264-params write files at any path
-    from modules.video_models.video_codecs import codecs_config
-    allowed = extra_option_keys | {key for codec in codecs_config.values() for key in parse_options(codec['options'])}
-    return sorted(set(parse_options(options)) - allowed)
-
-
 def atomic_save_video(
     filename: str,
     tensor: torch.Tensor,
     audio: torch.Tensor | None = None,
     fps: float = 24,
     codec: str = "libx264",
-    pix_fmt: str = "yuv420p",
+    pix_fmt: str | None = None,
     options: str = "",
     sample_rate: int = 24000,
     metadata: dict | None = None,
     pbar=None,
 ):
-    if metadata is None:
-        metadata = {}
-    av = check_av()
-    if av is None:
+    if check_av() is None:
         log.error('Video: ffmpeg/av not available')
-        return
-    savejob = shared.state.begin('Save video')
+        return False
     frames, height, width, _channels = tensor.shape
-    rate = round(fps)
-    parsed_options = parse_options(options)
-    log.info(f'Video: file="{filename}" codec={codec} frames={frames} width={width} height={height} fps={rate} audio={audio is not None} sample_rate={sample_rate} options={parsed_options}')
-    video_array = torch.as_tensor(tensor, dtype=torch.uint8).numpy(force=True)
-    task = pbar.add_task('encoding', total=frames) if pbar is not None else None
-    if task is not None:
-        pbar.update(task, description='video encoding')
-
-    with av.open(filename, mode="w") as container:
-        for k, v in metadata.items():
-            container.metadata[k] = v
-        stream: av.VideoStream = container.add_stream(codec, rate=rate, options=parsed_options)
-        stream.width = video_array.shape[2]
-        stream.height = video_array.shape[1]
-        stream.pix_fmt = pix_fmt
-        stream.time_base = Fraction(1, rate)
-        audio_stream = None
-        has_audio = (audio is not None) and ((torch.is_tensor(audio) or isinstance(audio, np.ndarray)) or (isinstance(audio, dict) and len(audio.get('frames', [])) > 0))
-        if has_audio:
-            sr = sample_rate if not isinstance(audio, dict) else audio.get("sr", sample_rate)
-            layout = "stereo" if not isinstance(audio, dict) else audio.get("layout", "stereo")
-            audio_stream = container.add_stream("aac", rate=sr)
-            audio_stream.layout = layout
-            audio_stream.time_base = Fraction(1, sr)
-        for i, img in enumerate(video_array):
-            frame = av.VideoFrame.from_ndarray(img, format="rgb24")
-            frame.pts = i
-            for packet in stream.encode_lazy(frame):
-                container.mux_one(packet)
+    has_audio = (audio is not None) and ((torch.is_tensor(audio) or isinstance(audio, np.ndarray)) or (isinstance(audio, dict) and len(audio.get('frames', [])) > 0))
+    audio_rate = None
+    audio_layout = 'stereo'
+    if has_audio:
+        audio_rate = audio.get('sr', sample_rate) if isinstance(audio, dict) else sample_rate
+        audio_layout = audio.get('layout', 'stereo') if isinstance(audio, dict) else 'stereo'
+    savejob = shared.state.record('Save video')
+    writer = None
+    try:
+        writer = open_video_writer(filename, width, height, fps, codec, pix_fmt, options, metadata, audio_rate=audio_rate, audio_layout=audio_layout)
+        log.info(f'Video: file="{filename}" codec={writer.codec} pix_fmt={writer.pix_fmt} frames={frames} width={writer.width} height={writer.height} fps={writer.rate} audio={audio is not None} sample_rate={sample_rate} options={writer.options}')
+        video_array = torch.as_tensor(tensor, dtype=torch.uint8).numpy(force=True)
+        task = pbar.add_task('encoding', total=frames) if pbar is not None else None
+        if task is not None:
+            pbar.update(task, description='video encoding')
+        for img in video_array:
+            writer.write(img)
             if task is not None:
                 pbar.update(task, advance=1)
-        if (audio is not None) and (torch.is_tensor(audio) or isinstance(audio, np.ndarray)):
-            add_audio_tensor(container, audio_stream, audio, sample_rate)
-        elif (audio is not None) and isinstance(audio, dict) and len(audio.get('frames', [])) > 0:
-            add_audio_packets(container, audio_stream, audio)
-        for packet in stream.encode():
-            container.mux_one(packet)
-
-    shared.state.outputs(filename)
-    shared.state.end(savejob)
+        if has_audio:
+            writer.write_audio(audio, sample_rate)
+        writer.release()
+        savejob.outputs.append(filename)
+    except Exception:
+        if writer is not None:
+            try:
+                writer.release()
+            except Exception as cleanup_error:
+                log.error(f'Video: file="{filename}" cleanup failed: {cleanup_error}')
+        raise
+    finally:
+        savejob.end()
+    return True
 
 
 def save_thumbnail(video_path, tensor=None):
@@ -287,7 +187,7 @@ def save_video(
     pixels: torch.Tensor | None = None,
     audio: torch.Tensor | None = None,
     binary: bytes | None = None,
-    mp4_fps: int = 24,
+    mp4_fps: float = 24,
     mp4_codec: str = "libx264",
     mp4_opt: str = "",
     mp4_ext: str = "mp4",
@@ -383,7 +283,7 @@ def save_video(
         audio_txt = None
     log.debug(f'Video: encode={t} tensor={pixels.shape} bytes={size} {audio_txt} fps={mp4_fps} codec={mp4_codec} ext={mp4_ext} options="{mp4_opt}"')
     try:
-        preparejob = shared.state.begin('Prepare video')
+        preparejob = shared.state.record('Prepare video')
         if stream is not None:
             stream.output_queue.push(('progress', (None, 'Saving video...')))
 
@@ -404,24 +304,24 @@ def save_video(
             fn = f'{output_filename}.safetensors'
             log.info(f'Video export: file="{fn}" type=savetensors shape={x.shape}')
             from safetensors.torch import save_file
-            shared.state.outputs(fn)
+            preparejob.outputs.append(fn)
             save_file({ 'frames': x }, fn, metadata={'format': 'video', 'frames': str(t), 'width': str(w), 'height': str(h), 'fps': str(mp4_fps), 'codec': mp4_codec, 'options': mp4_opt, 'ext': mp4_ext, 'interpolate': str(mp4_interpolate)})
 
         if mp4_frames:
             log.info(f'Video frames: files="{output_filename}-00000.jpg" frames={t} width={w} height={h}')
             for i in range(t):
-                image = cv2.cvtColor(x[i].numpy(), cv2.COLOR_RGB2BGR)
                 fn = f'{output_filename}-{i:05d}.jpg'
-                shared.state.outputs(fn)
-                cv2.imwrite(fn, image)
+                Image.fromarray(x[i].numpy()).save(fn, quality=95) # cv2.imwrite fails without an error on non-ASCII paths on Windows
+                preparejob.outputs.append(fn)
 
-        shared.state.end(preparejob)
+        preparejob.end()
 
         if mp4_video and (mp4_codec != 'none'):
-            output_video = f'{output_filename}.{mp4_ext}'
+            target = f'{output_filename}.{mp4_ext}'
             metadata = create_video_metadata(p, metadata, output_filename)
-            atomic_save_video(output_video, tensor=x, audio=audio, fps=mp4_fps, codec=mp4_codec, options=mp4_opt, sample_rate=aac_sample_rate, metadata=metadata, pbar=pbar)
-            if stream is not None:
+            if atomic_save_video(target, tensor=x, audio=audio, fps=mp4_fps, codec=mp4_codec, options=mp4_opt, sample_rate=aac_sample_rate, metadata=metadata, pbar=pbar):
+                output_video = target
+            if stream is not None and output_video is not None:
                 stream.output_queue.push(('progress', (None, f'Video {os.path.basename(output_video)} | Codec {mp4_codec} | Size {w}x{h}x{t} | FPS {mp4_fps}')))
                 stream.output_queue.push(('file', output_video))
         else:

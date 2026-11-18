@@ -217,15 +217,10 @@ def create_api(app):
 
 def verbose_task_factory(loop, coro, context=None):
     """Custom task factory that intercepts and logs every created task."""
-    # Retrieve the origin frame (where asyncio.create_task was called)
-    frame = coro.cr_frame if hasattr(coro, 'cr_frame') and coro.cr_frame else None
-    origin = f"{frame.f_code.co_filename}:{frame.f_lineno}" if frame else "unknown origin"
-
-    # Get the coroutine function name
     coro_name = getattr(coro, '__qualname__', str(coro))
-
-    print(f"[TASK CREATED] {coro_name} | Origin: {origin}")
-
+    # frame = coro.cr_frame if hasattr(coro, 'cr_frame') and coro.cr_frame else None
+    # origin = f"{frame.f_code.co_filename}:{frame.f_lineno}" if frame else "unknown origin"
+    # print(f"[TASK CREATED] {coro_name} | Origin: {origin}")
     # Fallback to the default Task creation (handles Python 3.11+ context kwargs)
     if context is not None:
         return asyncio.Task(coro, loop=loop, name=coro_name, context=context)
@@ -328,7 +323,8 @@ def resolve_paths(allowed_paths):
     folders = [modules.paths.resolve_output_path(f) for f in allowed_paths]
     folders = [f for f in folders if os.path.isdir(f)]
     folders = sorted(set(folders)) # remove duplicates
-    log.debug(f'Paths: {folders}')
+    if os.environ.get('SD_PATH_DEBUG', None) is not None:
+        log.debug(f'Paths: {folders}')
     return folders
 
 
@@ -374,13 +370,19 @@ def get_paths():
         allowed_paths.append(shared.cmd_opts.models_dir)
     if shared.cmd_opts.allowed_paths is not None:
         allowed_paths += [p for p in shared.cmd_opts.allowed_paths if os.path.isdir(p)]
-    if os.environ.get('SD_PATH_DEBUG', None):
+    if os.environ.get('SD_PATH_DEBUG', None) is not None:
         log.trace(f'Path allowed: why=args allowed={shared.demo.allowed_paths}')
     if shared.opts.allowed_paths:
         folders = [f.strip() for f in shared.opts.allowed_paths.split(',') if f.strip()]
         allowed_paths = [f for f in folders if os.path.isdir(f)]
-    if os.environ.get('SD_PATH_DEBUG', None):
+    if os.environ.get('SD_PATH_DEBUG', None) is not None:
         log.trace(f'Path allowed: why=opts allowed={shared.demo.allowed_paths}')
+    try:
+        from modules.ui_extra_networks import allowed_dirs
+        allowed_paths += allowed_dirs
+    except Exception:
+        pass
+    allowed_paths = list(set(allowed_paths))
     return allowed_paths
 
 
@@ -515,13 +517,12 @@ def webui(restart=False, _exit=False, profiler=None):
     modules.scheduler.start_worker(shared.cmd_opts.test)
     mount_subpath(app)
     shared.demo.allowed_paths = resolve_paths(shared.demo.allowed_paths)
-    shared.opts.save()
+    shared.opts.save_atomic()
 
     if shared.cmd_opts.profile:
         for k, v in modules.script_callbacks.callback_map.items():
             log.debug(f'Registered callbacks: {k}={len(v)} {[c.script for c in v]}')
     debug = log.trace if os.environ.get('SD_SCRIPT_DEBUG', None) is not None else lambda *args, **kwargs: None
-    debug('Trace: SCRIPTS')
     for m in modules.scripts_manager.scripts_data:
         debug(f'  {m}')
     debug('Loaded postprocessing scripts:')
@@ -530,14 +531,14 @@ def webui(restart=False, _exit=False, profiler=None):
     modules.script_callbacks.print_timers()
 
     if shared.cmd_opts.profile:
-        log.info(f"Launch time: {timer.launch.summary(min_time=0)}")
-        log.info(f"Installer time: {timer.init.summary(min_time=0)}")
-        log.info(f"Startup time: {timer.startup.summary(min_time=0)}")
+        log.info(f"Server launch: {timer.launch.summary(min_time=0)}")
+        log.info(f"Server installer: {timer.init.summary(min_time=0)}")
+        log.info(f"Server startup: {timer.startup.summary(min_time=0)}")
         modules.errors._profiler = profiler # pylint: disable=protected-access
     else:
         timer.startup.add('launch', timer.launch.get_total())
         timer.startup.add('installer', timer.init.get_total())
-        log.info(f"Startup time: {timer.startup.summary()}")
+        log.info(f"Server startup: {timer.startup.summary()}")
     timer.startup.reset()
 
     if _exit:
@@ -559,6 +560,7 @@ def webui(restart=False, _exit=False, profiler=None):
         for module in [module for name, module in sys.modules.items() if name.startswith("modules.ui")]:
             importlib.reload(module)
 
+    log.info('Server: ready')
     return shared.demo.server
 
 
